@@ -7,10 +7,10 @@ language, can load a manifest + verification context and assert the same
 
 Design rules that keep the vectors stable and portable:
 
-* **Fixed signing key.** All signed vectors use one Ed25519 key derived from
-  the seed ``00 01 02 ... 1f``. The public key (and key_id) is written to
-  ``keys.json`` so other languages can verify signatures without re-running
-  this script. Ed25519 is deterministic (RFC 8032), so signatures are
+* **Fixed signing keys.** Manifest vectors use one Ed25519 key derived from
+  the seed ``00 01 02 ... 1f``. HITL approvals use a distinct deterministic
+  key so the vectors do not imply that manifest issuers are their own human
+  approvers. Ed25519 is deterministic (RFC 8032), so signatures are
   reproducible byte-for-byte.
 * **Time-stable expectations.** Expiry/TTL/HITL windows use absolute dates far
   in the past or far in the future, so a vector's expected result does not
@@ -52,7 +52,7 @@ from agent_manifest._cose import (
     payload_hash,
     sign_cose_sign1,
 )
-from agent_manifest._delegation import DelegationHopSigner
+from agent_manifest._delegation import DelegationHopSigner, HitlApprovalSigner
 from agent_manifest._signing import (
     Ed25519Signer,
     ed25519_from_private_bytes,
@@ -76,6 +76,11 @@ assert (KP.key_id, KP.public_b64url()) == (KEY_ID, PUBLIC_KEY_B64URL), (
     "fixed signing key drifted from the published public key/key_id constants"
 )
 TRUSTED_KEYS = {KEY_ID: PUBLIC_KEY_B64URL}
+APPROVER_ID = "mailto:alice@example.com"
+APPROVER_KP = ed25519_from_private_bytes(bytes(reversed(range(32))))
+assert APPROVER_KP.public_bytes != KP.public_bytes, (
+    "the HITL approver key must be distinct from the manifest issuer key"
+)
 
 # Stable absolute timestamps (never "now").
 ISSUED_AT = "2025-01-01T00:00:00Z"
@@ -676,12 +681,22 @@ def build() -> list[dict[str, Any]]:
         {"result": "UNVERIFIABLE", "signature_verified": False},
     ))
 
-    # 007 - unsupported version
+    # 007 - unsupported version. Make the fixture future-shaped as well as
+    # future-versioned: current schema rejects the extra artifact, so this
+    # vector only reaches INCOMPATIBLE_VERSION when version negotiation truly
+    # precedes current-schema interpretation. Re-sign after the mutation so a
+    # signature failure cannot accidentally satisfy the expected result.
+    future = base_manifest(version="0.3")
+    future["artifacts"]["future_artifact"] = {
+        "format": "future-v1",
+        "binding": "sha256:" + "f" * 64,
+    }
+    _sign(future)
     vectors.append(_vector(
         "AM-VEC-007", "Unsupported manifest version is rejected before verifying.",
         # 0.2 is the COSE envelope and is supported; 0.3 does not exist, which
         # is what makes it the right stand-in for "a version from the future".
-        ["2.4"], base_manifest(version="0.3"), base_context(),
+        ["2.4"], future, base_context(),
         {"result": "INCOMPATIBLE_VERSION"},
     ))
 
@@ -698,13 +713,23 @@ def build() -> list[dict[str, Any]]:
     m = base_manifest(hitl_record={
         "required": True,
         "approvals": [{
+            "approver_id": APPROVER_ID,
             "approved_at": ISSUED_AT,
             "approved_scope": {"approval_duration_seconds": CENTURY_SECONDS},
+            "approval_signature": HitlApprovalSigner(APPROVER_KP).sign_approval(
+                manifest_id=MANIFEST_ID,
+                approved_at=ISSUED_AT,
+                approved_scope={"approval_duration_seconds": CENTURY_SECONDS},
+                approver_id=APPROVER_ID,
+            ),
         }],
     })
     vectors.append(_vector(
         "AM-VEC-009", "Required HITL with an unexpired approval passes under enforce_hitl.",
-        ["3.2.10", "5.3"], m, base_context(enforce_hitl=True),
+        ["3.2.10", "5.3"], m, base_context(
+            enforce_hitl=True,
+            approver_public_keys={APPROVER_ID: APPROVER_KP.public_b64url()},
+        ),
         {"result": "VALID", "fields_verified": {"hitl_record": "APPROVED"}},
     ))
 
@@ -804,10 +829,42 @@ def build() -> list[dict[str, Any]]:
     subset = {k: v for k, v in m.items() if k not in ("attestation", "transparency_log_entry")}
     attest_hash = "sha256:" + hashlib.sha256(canonicalize(subset)).hexdigest()
     m["attestation"] = {"platform": "tpm", "manifest_hash_in_report": attest_hash}
+    # The binding says the report is about *this* manifest. It says nothing
+    # about hardware: for v0.1 the attestation block is outside the signing
+    # pre-image (3.3 excludes it), so anyone holding a validly signed manifest
+    # can append a digest they computed themselves. attestation_verified is
+    # therefore false until an independent appraisal is supplied (018d).
     vectors.append(_vector(
-        "AM-VEC-018", "Attestation report hash matching the canonical manifest hash verifies.",
+        "AM-VEC-018",
+        "Attestation hash binding alone does not make attestation_verified true.",
         ["3.3"], m, base_context(),
+        {"result": "VALID", "attestation_verified": False},
+    ))
+
+    # 018d - the same manifest, with the hardware appraisal the relying party
+    # performed supplied as context. This is the only way the flag becomes true.
+    vectors.append(_vector(
+        "AM-VEC-018d",
+        "An independent hardware appraisal bound to this manifest makes attestation_verified true.",
+        ["3.3"], m,
+        base_context(
+            verified_attestation_manifest_hashes=[attest_hash],
+            attestation_evidence_manifest_id=MANIFEST_ID,
+        ),
         {"result": "VALID", "attestation_verified": True},
+    ))
+
+    # 018e - the same appraisal, bound to a different manifest. A passing
+    # appraisal must not be replayable onto another document.
+    vectors.append(_vector(
+        "AM-VEC-018e",
+        "A hardware appraisal bound to another manifest does not transfer.",
+        ["3.3"], m,
+        base_context(
+            verified_attestation_manifest_hashes=[attest_hash],
+            attestation_evidence_manifest_id="018f4a3b-0000-7e5f-a8b9-000000000000",
+        ),
+        {"result": "VALID", "attestation_verified": False},
     ))
 
     # 018b - the stale-attestation case from issue #265. The manifest is
@@ -881,6 +938,60 @@ def build() -> list[dict[str, Any]]:
         "AM-VEC-020",
         "Post-quantum crypto_profile with an Ed25519 signature is a downgrade.",
         ["4.2", "3.6"], base_manifest(crypto_profile="post-quantum"), base_context(),
+        {"result": "MISMATCH", "signature_verified": False},
+    ))
+
+    # 022 - a trusted key not authorized for the manifest's issuer (issue #325).
+    # The v0.1 counterpart of AM-VEC-COSE-009: the manifest, signature and
+    # signing key are byte-identical to AM-VEC-001, and only the context differs
+    # by naming a different authority in trusted_key_issuers. A verifier that
+    # stops at "the signature verifies under a trusted key" returns VALID here
+    # and has no key-to-issuer authorization boundary at all.
+    #
+    # signature_verified is false, not true as on AM-VEC-COSE-009: the v0.1
+    # path evaluates the issuer binding before it verifies the detached
+    # signature (spec 5.3), so on a mismatch it never reaches verification and
+    # the flag stays false. The COSE path appraises the envelope signature
+    # first, so its analog records true.
+    vectors.append(_vector(
+        "AM-VEC-022",
+        "A trusted key not authorized for the manifest's issuer is rejected.",
+        ["5.3"], base_manifest(),
+        base_context(
+            trusted_key_issuers={KEY_ID: ["spiffe://trust.example/other-authority"]}
+        ),
+        {"result": "MISMATCH", "signature_verified": False},
+    ))
+
+    # 023 - the subject presented as the authority. trusted_key_issuers names
+    # the manifest's own agent_id ("spiffe://trust.example/agent/kyc/prod")
+    # rather than its issuer, so the key is authorized for the subject it signs
+    # for and not for the issuer that signed. Companion to AM-VEC-022: a
+    # verifier that compared the key's authorization against agent_id instead of
+    # issuer would accept this one, so the two together pin that the binding is
+    # to the issuer specifically.
+    vectors.append(_vector(
+        "AM-VEC-023",
+        "A key authorized for the subject (agent_id) but not the issuer is rejected.",
+        ["5.3"], base_manifest(),
+        base_context(
+            trusted_key_issuers={KEY_ID: ["spiffe://trust.example/agent/kyc/prod"]}
+        ),
+        {"result": "MISMATCH", "signature_verified": False},
+    ))
+
+    # 024 - a signing key with no entry in the authorization path at all. The
+    # manifest, signature and signing key are byte-identical to AM-VEC-001; only
+    # trusted_key_issuers differs, by being empty. Companion to AM-VEC-022/023:
+    # those show a key authorized for the wrong authority (022) or for the
+    # subject instead of the issuer (023). This one shows the key resolved
+    # through no authorization path whatsoever.
+    vectors.append(_vector(
+        "AM-VEC-024",
+        "A signing key with no entry in the authorization path is rejected.",
+        ["5.3"], base_manifest(),
+        base_context(
+            trusted_key_issuers={}),
         {"result": "MISMATCH", "signature_verified": False},
     ))
 
