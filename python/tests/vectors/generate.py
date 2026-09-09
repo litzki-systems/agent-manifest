@@ -17,7 +17,7 @@ Design rules that keep the vectors stable and portable:
   change with wall-clock time for roughly the next century.
 * **Self-contained context.** Each vector carries the full
   ``VerificationContext`` under ``context`` (1:1 with the SDK model), plus
-  optional `revoke: true` to seed the revocation store before verifying.
+  optional ``revoke: true`` to seed the revocation store before verifying.
 
 Run from the repo's ``python/`` directory:
 
