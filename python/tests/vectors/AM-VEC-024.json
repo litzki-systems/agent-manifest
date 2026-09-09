@@ -1,6 +1,6 @@
 {
   "id": "AM-VEC-024",
-  "description": "A signing key with no entry in the authorization path is rejected.",
+  "description": "A signing key with an authorization entry that authorizes no issuer is rejected.",
   "spec_refs": [
     "5.3"
   ],
@@ -67,7 +67,9 @@
     "trusted_keys": {
       "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
     },
-    "trusted_key_issuers": {}
+    "trusted_key_issuers": {
+      "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c": []
+    }
   },
   "expected": {
     "result": "MISMATCH",
