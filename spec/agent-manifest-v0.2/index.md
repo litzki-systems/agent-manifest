@@ -1,0 +1,2044 @@
+# Agent Manifest Specification
+
+| Field                 | Value                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Version               | 0.2 - Draft for Review                                                                                                                                                                                                                                                                                                                                                  |
+| Subtitle              | A cryptographic identity and provenance standard for AI agents                                                                                                                                                                                                                                                                                                          |
+| Authors               | Imran Siddique (AgenTrust)                                                                                                                                                                                                                                                                                                                                              |
+| Status                | Draft v0.2 - Proposed Open Standard                                                                                                                                                                                                                                                                                                                                     |
+| Date                  | August 2026                                                                                                                                                                                                                                                                                                                                                             |
+| Changes in 0.2        | `@context` URI moved to a controlled domain (ADR-0012). Signature envelope moves to COSE_Sign1, specified in [agent-manifest-cose-envelope-v0.2.md](https://manifest.agentrust-io.com/spec/agent-manifest-cose-envelope-v0.2/index.md) (ADR-0011); Ed25519 is identified by `-19` (ADR-0014). `version` is `"0.2"`. Field definitions are otherwise unchanged from 0.1. |
+| Relationship          | Extends: OWASP ASI 2026                                                                                                                                                                                                                                                                                                                                                 |
+| Target Standards Body | Coalition for Secure AI (CoSAI) WS4 - OASIS Open                                                                                                                                                                                                                                                                                                                        |
+
+______________________________________________________________________
+
+## Abstract
+
+The Agent Manifest is a cryptographically signed, hardware-attestable document that establishes the trust surface of an AI agent at deployment time. It binds ten attestable artifacts - system prompt, policy bundle, tool manifest, model identity, RAG corpus, memory baseline, decision-log baseline, A2A delegation chain, supply chain provenance, and human-in-the-loop approval records - into a single tamper-evident identity primitive. A verifying party who holds an Agent Manifest and its accompanying attestation report can prove, without trusting the operator, that a specific agent instance started with specific code, policy, tools, audit-chain root, and human oversight. Decisions produced after deployment are separate TRACE or OCSF evidence records and MUST be joined back to this manifest; their signatures prove integrity, not completeness or behavioral correctness. This specification defines the manifest data model, the cryptographic binding protocol, the hardware attestation integration, the verification API, and the conformance requirements for compliant implementations.
+
+## Why This Matters Now
+
+MCP's emergence as the dominant agent-to-tool protocol has made the agent trust surface explicit and exploitable. In the period between January and February 2026, researchers filed over 30 CVEs targeting MCP servers, clients, and tooling. Palo Alto Unit 42 found that with five connected MCP servers, a single compromised server hit a 78.3% attack success rate. The problem is not MCP's protocol design - it is the absence of a standard identity primitive that makes every agent's approved deployment context verifiable to a third party. A signed JWT proves who called an API. An Agent Manifest proves who the agent was, which tools it was approved to hold, how it was built, which audit-chain baseline it started from, who approved it, and whether the deployment configuration changed before execution. It does not prove that a particular call through one of those tools may run; that is the authorization question section 5.3.2 keeps separate.
+
+## 1. Problem Statement
+
+### 1.1 The Agent Identity Gap
+
+Every entity in a modern enterprise system has a verifiable identity. Users have X.509 certificates and OAuth tokens. Services have SPIFFE SVIDs. APIs have signed JWTs. Containers have image digests. Infrastructure has hardware TPM measurements. AI agents have none of these. An agent calling a tool today presents no unforgeable proof of:
+
+- Which system prompt defined its behavior
+- Which model version is running
+- Which policy bundle was approved
+- Which tools were authorized
+- What knowledge base it was grounded on
+- Whether its memory has been tampered with
+- What decisions it made and why
+- Whether a human approved high-stakes actions
+- Which agent delegated to it in a multi-agent chain
+- Whether its binary matches what was reviewed
+
+This is not an authentication gap - agents can authenticate with certificates and tokens today. It is an attestation gap: the inability to prove, to a third party who does not trust the operator, that the agent running right now is the agent that was approved, with the tools that were authorized, under the policy that was reviewed.
+
+### 1.2 Why Software Attestation Is Insufficient
+
+Existing approaches reduce to operator trust. A software-signed manifest proves the operator intended a configuration. It does not prove the running agent matches it. A privileged operator or compromised dependency can:
+
+- Replace a system prompt in memory after the manifest is signed
+- Swap a model version between approval and runtime
+- Silently extend tool capabilities via MCP `notifications/tools/list_changed`
+- Inject into the RAG corpus without changing the corpus hash
+- Forge a human-in-the-loop approval record
+- Rewrite audit logs and re-sign with a software-held key
+
+> The Anthropic Design Test - Applied to Agent Identity
+>
+> Anthropic's Zero Trust for AI Agents framework asks whether a control makes an attack impossible or merely tedious. Software-only manifests are tedious: a privileged operator can rewrite them. Hardware raises the bar in two specific ways.
+>
+> First, the TEE launch measurement (SNP `MEASUREMENT`, TDX `MRTD`, TPM PCRs) is computed in silicon before any guest code runs, so the launch image cannot be altered undetected. Second, a signing key sealed to that measurement exists only inside an attested environment, so valid signatures cannot be produced anywhere else.
+>
+> What hardware does not do is measure individual files or in-memory objects after boot. Binding a manifest hash into a guest-supplied report field is an assertion by guest software, not a silicon measurement. The manifest makes tampering tamper-evident to a verifier who checks the full attestation chain and confirms the signing key is sealed to the measurement. It does not make in-memory tampering impossible. Read the conformance levels with that boundary in mind.
+
+### 1.3 The Ten Unattested Surfaces
+
+The following table enumerates the complete agent trust surface. Columns indicate whether each artifact is attestable by software, by hardware, or not at all under current practice.
+
+| #   | Artifact              | What It Defines                                             | Attack if Unattested                                               | Current Coverage            | Agent Manifest  |
+| --- | --------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------- | --------------- |
+| 1   | System Prompt         | Agent persona, behavioral boundaries, safety constraints    | Prompt injection silently redefines the agent's goals              | None - cleartext in memory  | Full binding    |
+| 2   | Policy Bundle         | Cedar/YAML/Rego governance rules; allow/deny decisions      | Policy swap grants unapproved permissions silently                 | AGT + cMCP (software hash)  | Hardware-sealed |
+| 3   | Tool Manifest         | Tool schemas, capability declarations, endpoint bindings    | Schema extension silently expands agent capabilities               | AGT tool scanner (software) | Full binding    |
+| 4   | Model Identity        | Model family, version, safety alignment level, quantization | Unapproved version may lack safety training                        | None - operator asserted    | Full binding    |
+| 5   | RAG Corpus            | Knowledge base identity, version, ingestion policy          | Corpus poisoning changes outputs without touching policy           | None - no standard          | Merkle root     |
+| 6   | Memory Baseline       | Approved memory state for long-running agents               | Memory drift corrupts behavior across sessions undetected          | None - no standard          | Snapshot hash   |
+| 7   | Decision-log baseline | Audit-chain root at manifest issuance                       | No trustworthy join between approved deployment and later evidence | AGT audit root              | TEE-bound root  |
+| 8   | A2A Delegation        | Agent-to-agent trust chain; delegated scope constraints     | Orchestrator spoofing; scope laundering across delegation hops     | None - no standard          | Chain binding   |
+| 9   | Supply Chain          | Container manifest; SLSA provenance; dependency SBOMs       | Compromised dependency runs as approved binary                     | SLSA (build-time only)      | Runtime measure |
+| 10  | HITL Approvals        | Human oversight records with identity and timestamp         | EU AI Act Art. 14 violation; no accountability chain               | None - no standard          | Full binding    |
+
+> What the "Agent Manifest" column means. "Binding" in this table is a cryptographic *signature* binding inside an attested environment, not a hardware *measurement* of each artifact. The TEE measures the launch image in silicon; it does not measure individual files, policy documents, or in-memory objects after boot. A binding is therefore only as strong as a verifier who checks the full attestation chain and confirms the signing key is sealed to the launch measurement. Terms like "hardware-sealed" and "TEE-signed" should be read in that sense.
+
+## 2. Specification Overview
+
+### 2.1 Design Principles
+
+The Agent Manifest specification is designed around five principles:
+
+P1 - Tamper-evidence over tamper-resistance
+
+The manifest does not prevent tampering by making changes difficult. It makes tampering detectable by a third party who holds the manifest and compares it to a hardware attestation report. Any change to any bound artifact produces a measurement mismatch. Detection is cryptographic, not procedural.
+
+P2 - Independence from operator trust
+
+A verifying party must be able to confirm manifest integrity without trusting the operator who produced it. This requires hardware-rooted attestation (TEE measurement) for the binding layer, and a trust root that is not controlled by the entity being attested. a TEE-anchored attestation service provides this root; the specification defines the protocol for independent verification.
+
+P3 - Composability with existing standards
+
+The manifest does not replace SPIFFE/SPIRE, SLSA, SBOMs, or MCP. It composes with them. Agent identity uses SPIFFE SVIDs. Supply chain provenance uses SLSA attestation and CycloneDX SBOMs. Tool identity uses MCP's tool descriptor schema extended with a manifest binding. Policy identity uses AGT's Cedar bundle format. The manifest is the envelope that binds all of these into a single verifiable artifact.
+
+P4 - Minimal footprint, maximal verifiability
+
+The manifest stores hashes and identifiers, not content. The system prompt hash is bound; the system prompt itself is not stored in the manifest. This keeps manifests small, portable, and privacy-preserving, while ensuring that any change to any artifact breaks the hash binding and is therefore detectable.
+
+P5 - Protocol agnosticism with MCP as the reference implementation
+
+The manifest is defined for any agent communication protocol. The reference implementation targets MCP because it is currently the dominant agentic wire protocol. The delegation chain cryptographic layer is protocol-agnostic by design. When A2A publishes a stable tool descriptor schema, the `tool_manifest` binding will be extended to support it; until then, field names in section 3.2.3 use MCP terminology as the reference implementation, with protocol-agnostic equivalents noted.
+
+### 2.2 Manifest Lifecycle
+
+An Agent Manifest is created once per agent deployment, updated when any bound artifact changes, and verified at every trust boundary crossing. The lifecycle has five phases:
+
+| Phase           | Trigger                                                         | Actor                                          | Output                                                                                             |
+| --------------- | --------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| 1. Authoring    | Agent deployment configuration complete                         | Agent developer / platform team                | Unsigned draft manifest (JSON-LD)                                                                  |
+| 2. Signing      | Human security reviewer approves configuration                  | Security officer / CISO delegate               | Signed manifest (detached Ed25519 or ML-DSA-65 signature over the RFC 8785 pre-image, section 3.6) |
+| 3. Attestation  | Agent workload launches inside TEE                              | the Confidential Runtime                       | TEE attestation report binding manifest hash to hardware measurements                              |
+| 4. Verification | Agent crosses a trust boundary (tool call, delegation, audit)   | Relying party (MCP server, auditor, regulator) | Verification result: VALID                                                                         |
+| 5. Revocation   | Any bound artifact changes, compromise detected, or TTL expires | Agent owner or the revocation service          | Revocation record published to transparency log                                                    |
+
+Authoring and Update Protocol
+
+The `manifest_id` field is immutable per issuance. Any change to any signed field MUST produce a new manifest document with a new UUID v7 `manifest_id`. A `previous_manifest_id` field MAY be set in the new manifest to establish audit continuity. There is no in-place update mechanism - every change produces a new manifest.
+
+Two update paths are defined:
+
+- Full re-issuance: A new UUID v7, a new TEE attestation run, and a new transparency log entry. Required when any artifact binding changes, the signing key rotates, or the manifest expires.
+- Artifact-only refresh: **Withdrawn at Level 1 and above** in favour of the memory checkpoint protocol. It permitted `memory_baseline.snapshot_hash` to be renewed and the manifest re-signed without re-running the TEE attestation, which cannot hold: `manifest_hash_in_report` (section 3.3) is computed over the full manifest including the `signature` block, so changing the snapshot hash and re-signing changes the attested pre-image twice over. The retained attestation binds the previous document. A verifier had to either reject the refreshed manifest or stop enforcing the binding, and both cannot be conformant at once. At Level 1 and above, any change to a signed field MUST produce a new manifest and a fresh attestation binding its new `manifest_hash_in_report`. At Level 0 there is no attestation to invalidate, so a re-signed manifest with a new `manifest_id` is the only requirement and the refresh path adds nothing.
+- Governed memory evolution: Memory may advance without re-attesting the root manifest through the checkpoint and delta protocol in section 3.2.6.2, which binds the advance in a separate object with its own consistency proof and freshness rule. That protocol exists so a growing memory store does not have to mutate the document whose exact hash was attested. A checkpoint advance is not a refreshed manifest and MUST NOT be presented as one.
+
+Version Negotiation
+
+A verifying party MUST inspect the `version` field before processing any other field. If the verifying party does not support the declared version, it MUST return a verification result of `INCOMPATIBLE_VERSION` and MUST NOT return `VALID` or `MISMATCH`. A verifying party that supports version N MUST NOT process a manifest with version greater than N - forward compatibility is not guaranteed across versions. Manifest producers MUST set `version` to the lowest spec version whose features they use. An optional `min_verifier_version` field (type: string, semantic version) MAY be set by the manifest author to signal that a minimum verifier version is required to correctly process the manifest.
+
+Key Rotation
+
+When a manifest signing key is rotated, the following protocol applies: (1) a new manifest MUST be issued signed by the successor key; (2) the new manifest MUST reference the previous manifest's transparency log entry in a `prior_transparency_log_entry` field; (3) the old manifest MUST be revoked upon rotation completion; (4) a `key_rotation` event type MUST be published to the transparency log. Verifiers traversing the rotation chain confirm continuity by checking that each successor manifest's `prior_transparency_log_entry` references a valid, previously-VALID manifest for the same `agent_id`.
+
+### 2.3 Canonical Serialization
+
+All canonical JSON serialization in this specification uses RFC 8785 (JSON Canonicalization Scheme, JCS). This applies without exception to:
+
+- Manifest signature pre-image computation (section 3.6)
+- Per-artifact hash inputs for text artifacts
+- `manifest_hash_in_report` pre-image (section 3.3)
+- Memory snapshot hash input (section 3.2.6)
+- Evidence pack hash (section 5.2)
+- All Merkle tree leaf computations involving JSON content
+
+The `@context` and `@type` JSON-LD fields are treated as ordinary JSON fields for canonicalization purposes. Full JSON-LD RDF dataset normalization (RDNA/GPN-09) is NOT used and MUST NOT be used as a substitute for JCS - the two algorithms produce different canonical forms. Implementations MUST reject manifests where the signature does not verify under RFC 8785 canonicalization.
+
+Test vector: The object `{"b":2,"a":1}` canonicalizes under RFC 8785 to the UTF-8 byte sequence `{"a":1,"b":2}` (lexicographic key order, no insignificant whitespace). Its SHA-256 is `43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777`. Implementations MUST reproduce this value.
+
+Null-valued optional fields MUST be omitted from the canonical form rather than included with a `null` value, unless this specification explicitly states a field is required and may be null (e.g., `model_hash` when `deployment_type` is `api`).
+
+SHAKE-256 output length: For all artifact hash fields in the post-quantum profile, SHAKE-256 output length MUST be 256 bits (32 bytes), producing a 64-character lowercase hexadecimal string. SHAKE-256 hash values MUST be prefixed with `shake256:` in field values to distinguish them from SHA-256 hashes.
+
+### 2.4 Version Negotiation
+
+Manifest producers and verifiers negotiate spec compatibility using the `version` field in the manifest and the `spec_version` field in VerificationResult.
+
+Producer requirements:
+
+- MUST set `version` to the spec version used for manifest construction (`"0.2"` for this specification, `"0.1"` for the previous one).
+- MUST NOT produce fields defined only in later spec versions when targeting an older verifier.
+
+Verifier requirements:
+
+- MUST check `version` before verifying. If the version is unsupported, MUST return `INCOMPATIBLE_VERSION` rather than silently misinterpreting fields.
+- SHOULD support at least the current and one prior minor version.
+
+**Issuing v0.1 manifests ends 2026-11-30.** From that date the reference implementation produces v0.2 COSE envelopes only, and a producer SHOULD NOT set `version` to `"0.1"`.
+
+**Verifying v0.1 manifests is not deprecated and has no end date.** Manifests are audit records under retention obligations that outlast their validity by years, so a verifier that stopped reading them would destroy evidence rather than remove code. `INCOMPATIBLE_VERSION` stays reserved for versions a verifier genuinely cannot interpret, never for v0.1.
+
+Compatibility matrix:
+
+| Producer version | Verifier supports | Result                                                               |
+| ---------------- | ----------------- | -------------------------------------------------------------------- |
+| 0.1              | 0.1               | VALID (if artifacts match)                                           |
+| 0.2              | 0.1               | INCOMPATIBLE_VERSION                                                 |
+| 0.1              | 0.2               | VALID (0.2 verifiers MUST be backward-compatible with 0.1 manifests) |
+
+## 3. Data Model
+
+### 3.1 Top-Level Schema
+
+An Agent Manifest is a JSON-LD document conforming to the following schema. All hash fields use SHA-256 unless the implementation has opted into the post-quantum profile, in which case SHAKE-256 is used (see section 2.3 for output length). Hash field values MUST conform to the pattern `^(sha256|shake256):[0-9a-f]{64}$`. Signature fields use Ed25519 for standard deployments and ML-DSA-65 for post-quantum deployments.
+
+```
+{
+  "@context": "https://manifest.agentrust-io.com/v0.2/context.json",
+  "@type": "AgentManifest",
+  "manifest_id": "<string, UUID v7 per RFC 9562 - REQUIRED>",
+  "previous_manifest_id": "<string, UUID v7 - OPTIONAL, set on re-issuance>",
+  "agent_id": "<string, SPIFFE URI - REQUIRED>",
+  "agent_instance_id": "<string, UUID v7 - OPTIONAL, present only on an instance-scoped manifest>",
+  "version": "<string - REQUIRED, set to '0.1'>",
+  "min_verifier_version": "<string, semantic version - OPTIONAL>",
+  "issued_at": "<string, ISO 8601 UTC - REQUIRED>",
+  "expires_at": "<string, ISO 8601 UTC - REQUIRED, default issued_at + 90 days>",
+  "issuer": "<string, SPIFFE URI of signing authority - REQUIRED>",
+  "crypto_profile": "<string, 'standard' | 'post-quantum' - REQUIRED>",
+  "profile": "<string, 'composition-only' - OPTIONAL; absence means full binding>",
+  "unbound_artifacts": "<non-empty array of artifact names - REQUIRED for composition-only>",
+  "source_bundle": "<object - OPTIONAL, signed package binding; see section 3.1.2>",
+  "artifacts": "<object - REQUIRED, see section 3.2>",
+  "attestation": "<object - REQUIRED for Level 1+, see section 3.3>",
+  "delegation_chain": "<array - REQUIRED if agent is spawned by another agent, see section 3.4>",
+  "hitl_record": "<object - REQUIRED if any policy mandates HITL, see section 3.5>",
+  "signature": "<object - REQUIRED, see section 3.6>",
+  "transparency_log_entry": "<object - REQUIRED for production, see section 3.6>"
+}
+```
+
+Field cardinality table
+
+| Field                    | Type                           | Cardinality                        | Constraint                                                                                                                                                                                                                                                             |
+| ------------------------ | ------------------------------ | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `manifest_id`            | string (UUID v7, RFC 9562)     | REQUIRED                           | Version nibble MUST be 7. Canonical 8-4-4-4-12 hyphenated lowercase hex.                                                                                                                                                                                               |
+| `previous_manifest_id`   | string (UUID v7, RFC 9562)     | OPTIONAL                           | Set on re-issuance to establish audit chain continuity.                                                                                                                                                                                                                |
+| `agent_id`               | string (SPIFFE URI)            | REQUIRED                           | Trust domain lowercase `[a-z0-9._-]`; path segments `[a-zA-Z0-9._-]`. URI MUST NOT exceed 2048 bytes.                                                                                                                                                                  |
+| `agent_instance_id`      | string (UUID v7, RFC 9562)     | OPTIONAL                           | Present only when this manifest governs a single run. Absence means the manifest governs every run of `agent_id`. See section 6.4.2.                                                                                                                                   |
+| `version`                | string                         | REQUIRED                           | MUST be `"0.2"` for this specification version. `"0.1"` identifies a manifest issued under the v0.1 specification, which stays verifiable; see section 2.4 and the [COSE envelope](https://manifest.agentrust-io.com/spec/agent-manifest-cose-envelope-v0.2/index.md). |
+| `min_verifier_version`   | string (semver)                | OPTIONAL                           | Minimum verifier version required to correctly process this manifest.                                                                                                                                                                                                  |
+| `issued_at`              | string (ISO 8601 UTC)          | REQUIRED                           |                                                                                                                                                                                                                                                                        |
+| `expires_at`             | string (ISO 8601 UTC)          | REQUIRED                           | Default: `issued_at` + 90 days. MUST NOT be more than 365 days after `issued_at` for Level 1+. MUST NOT be less than 1 hour after `issued_at`.                                                                                                                         |
+| `issuer`                 | string (SPIFFE URI)            | REQUIRED                           |                                                                                                                                                                                                                                                                        |
+| `crypto_profile`         | string enum                    | REQUIRED                           | `"standard"` or `"post-quantum"`.                                                                                                                                                                                                                                      |
+| `profile`                | string enum                    | OPTIONAL                           | `"composition-only"`. Absence preserves the full-binding behavior defined before this field existed.                                                                                                                                                                   |
+| `unbound_artifacts`      | array of artifact-name strings | CONDITIONALLY REQUIRED             | REQUIRED and non-empty for `composition-only`; otherwise MUST be absent.                                                                                                                                                                                               |
+| `source_bundle`          | object                         | OPTIONAL                           | Signed format identifier and digest of the package from which this manifest was derived.                                                                                                                                                                               |
+| `artifacts`              | object                         | REQUIRED                           |                                                                                                                                                                                                                                                                        |
+| `attestation`            | object                         | REQUIRED for Level 1+              | MUST be omitted (not null) at Level 0.                                                                                                                                                                                                                                 |
+| `delegation_chain`       | array                          | CONDITIONALLY REQUIRED             | REQUIRED when agent is spawned by another agent. Empty array is invalid - omit the field entirely if no delegation.                                                                                                                                                    |
+| `hitl_record`            | object                         | CONDITIONALLY REQUIRED             | REQUIRED when any bound policy mandates human-in-the-loop approval.                                                                                                                                                                                                    |
+| `signature`              | object                         | REQUIRED                           |                                                                                                                                                                                                                                                                        |
+| `transparency_log_entry` | object                         | REQUIRED for production (Level 1+) | Separate from `signature`; populated after log submission.                                                                                                                                                                                                             |
+
+The `expires_at` field MUST be present. If omitted by the manifest author, implementations MUST default to `issued_at` + 90 days. The `expires_at` value MUST NOT be more than 365 days after `issued_at` for Level 1 and above deployments. The `expires_at` value MUST NOT be less than 1 hour after `issued_at`. A verifying party MUST reject a manifest whose `expires_at` is in the past at the time of verification.
+
+All fields annotated as UUID v7 MUST conform to RFC 9562 Section 5.7. The string representation MUST use the canonical 8-4-4-4-12 hyphenated lowercase hexadecimal format. The version nibble MUST be 7 (binary 0111). Implementations MUST reject UUID fields whose version nibble is not 7.
+
+The `agent_id` path structure `/agent/<name>/<instance>` shown in examples is a convention, not a requirement. Trust domain must be lowercase `[a-z0-9._-]`; path segments may use `[a-zA-Z0-9._-]`. UUID v7 instance identifiers (hyphens permitted in path segments) are valid. Example: `spiffe://trust.example/agent/payments-processor/01926b4c-1234-7abc-9def-000000000001`.
+
+`agent_id` is the **stable** logical identity of the agent: it identifies the agent across restarts and across runs. A deployment MAY still encode an instance in the SPIFFE path, but a verifier or evidence consumer MUST NOT infer instance scope from the path, because the structure above is a convention and a path segment carries no declared meaning.
+
+Instance scope is declared, not parsed. A manifest issued for a single run SHOULD carry `agent_instance_id`, and its absence means the manifest governs every run of `agent_id`. Because changing a signed field requires re-issuance (and, at Level 1 or above, fresh attestation binding and transparency-log publication), instance-scoped manifests are intended for long-lived or high-risk runs where that cost is warranted. Multi-run manifests remain the normal operating model for high-volume conversational sessions. This is what lets one field stop serving two lifetimes; section 6.4.2 gives the resulting correlation rules.
+
+The `@context` URL `https://manifest.agentrust-io.com/v0.2/context.json` is provisional for the v0.2 draft period. The CoSAI WS4 working stream will assign the canonical URL prior to v1.0 ratification, and implementations MUST support the canonical CoSAI-assigned URL when it is assigned.
+
+The v0.1 context URL `https://agentmanifest.agentrust.io/v0.1/context.json` is **withdrawn and MUST NOT be accepted**. Its authority component named a domain this project has never controlled, so it identified manifests under a name belonging to a third party and never resolved. Implementations cut over rather than accepting both: an implementation that honoured the v0.1 URL would keep validating manifests named on a domain we do not own. Manifests already issued under v0.1 remain checkable against the v0.1 specification, which stays published.
+
+Artifact-to-field mapping (for Level 2 "all 10 artifacts bound" conformance):
+
+| Artifact # | Artifact Name         | JSON field location                  |
+| ---------- | --------------------- | ------------------------------------ |
+| 1          | System Prompt         | `artifacts.system_prompt`            |
+| 2          | Policy Bundle         | `artifacts.policy_bundle`            |
+| 3          | Tool Manifest         | `artifacts.tool_manifest`            |
+| 4          | Model Identity        | `artifacts.model_identity`           |
+| 5          | RAG Corpus            | `artifacts.rag_corpus`               |
+| 6          | Memory Baseline       | `artifacts.memory_baseline`          |
+| 7          | Decision-log baseline | `artifacts.decision_trace`           |
+| 8          | A2A Delegation        | `delegation_chain` (top-level array) |
+| 9          | Supply Chain          | `artifacts.supply_chain`             |
+| 10         | HITL Approvals        | `hitl_record` (top-level object)     |
+
+For Level 2, "all 10 artifacts bound" means artifacts 1-7 and 9 MUST be present in `artifacts`; `delegation_chain` MUST be a non-empty array if the agent is spawned by another agent; and `hitl_record.required` MUST be `true` with at least one approval present.
+
+#### 3.1.1 Composition-only profile
+
+A repository, policy gate, or marketplace scanner can know the composition it contributes before a model or execution session exists. Such a producer MAY issue a manifest with `profile: "composition-only"`. This profile authenticates a contribution to a future agent; it does not describe an agent instance and is not eligible for conformance Level 0 or above. A verifier that otherwise authenticates it MUST return `INCOMPLETE`, while still returning the per-artifact verification results it was able to compute.
+
+`unbound_artifacts` MUST be present and non-empty on a composition-only manifest. Its values are the ten artifact field names in the mapping above: `system_prompt`, `policy_bundle`, `tool_manifest`, `model_identity`, `rag_corpus`, `memory_baseline`, `decision_trace`, `delegation_chain`, `supply_chain`, and `hitl_record`. Every artifact not present in the manifest MUST be named in `unbound_artifacts`, and an artifact MUST NOT be both present and named as unbound. Values MUST NOT repeat. A verifier MUST reject an omission that is not declared and a bound/unbound contradiction as a schema mismatch.
+
+For each declared name, the verification result MUST be `NOT_BOUND`. `NOT_BOUND` says only that this manifest deliberately makes no claim about that artifact; it MUST NOT be interpreted as a match, a measured zero, or permission to run without the artifact. A later full manifest can bind the completed agent instance.
+
+Both `profile` and `unbound_artifacts` are in the signing pre-image. A party that removes the profile, narrows the unbound list, or rewrites its entries after issuance MUST invalidate the signature. When `profile` is absent, `unbound_artifacts` MUST also be absent and the original full-binding cardinality rules apply, preserving all existing manifests and signatures.
+
+#### 3.1.2 Source bundle binding
+
+`source_bundle` binds the package from which a manifest was derived. It has exactly two fields:
+
+```
+{
+  "format": "agent-plugins-1.0.0",
+  "digest": "sha256:<64 lowercase hex characters>"
+}
+```
+
+`format` identifies the digest profile, not merely a media type. This version defines `agent-plugins-1.0.0`, whose digest algorithm is specified in section 6.5.3. `digest` MUST be a valid `HashValue`. A verifier MUST reject an unknown format rather than applying a familiar digest algorithm to unfamiliar package semantics.
+
+`source_bundle` is in the signing pre-image. It attests which package supplied the pre-execution composition; it does not assert that every runtime artifact was resolved from that package. The individual artifact bindings continue to state what was actually bound.
+
+### 3.2 Artifact Bindings
+
+Each artifact is represented by a binding object containing the artifact's cryptographic hash, its identifier or locator, the binding timestamp, and optionally a structured descriptor. The binding object is what appears in the manifest; the artifact itself is stored separately and referenced by hash.
+
+#### 3.2.1 System Prompt Binding
+
+```
+"system_prompt": {
+  "hash": "sha256:<64-hex-chars>  -- REQUIRED",
+  "hash_algorithm": "SHA-256 | SHAKE-256  -- REQUIRED",
+  "version": "<semantic version or timestamp>  -- REQUIRED",
+  "classification": "public | internal | confidential | restricted  -- REQUIRED",
+  "language": "<BCP 47 language tag>  -- OPTIONAL",
+  "safety_level": "<operator-defined safety tier>  -- OPTIONAL",
+  "assurance_test": "<object - OPTIONAL, see 3.2.1.1>",
+  "bound_at": "<ISO 8601 UTC>  -- REQUIRED"
+}
+```
+
+The system prompt hash binds the complete byte sequence of the prompt as delivered to the model. Any modification - including whitespace changes, character encoding changes, or appended injections - produces a different hash and invalidates the manifest. Implementations MUST hash the prompt as a UTF-8 byte sequence with no BOM, normalized to NFC.
+
+`safety_level` is an operator assertion. It has no defined value space, no constraint, and no verification behaviour, and a verifier MUST NOT treat it as evidence of anything. It is retained because deployments use it as a routing label, and named here as an assertion so it is not read as the assurance signal the field name suggests. `assurance_test` (3.2.1.1) is where evidence about the approved prompt's behaviour goes.
+
+##### 3.2.1.1 Configuration Assurance
+
+The threat model in 7.1 treats artifact #1 as covered: T1 is prompt substitution, and `system_prompt.hash` detects it. Every threat in 7.1 is a substitution, mutation, or forgery by an adversary, and the nearest exclusion in 7.2 is semantic prompt injection, which also presumes adversarial input.
+
+There is a hazard in this artifact that is neither addressed nor excluded: a prompt authored in good faith, reviewed, approved, signed, sealed to a TEE measurement, and verified `VALID` at every conformance level, which specifies behaviour the deploying organisation would reject if it were tested rather than read. No adversary is present and no digest changes. Artifact #1 is not data the agent consumes; it is the specification of the agent's behaviour, so its hazard is expressible in the approved value itself. For this artifact digest equality is necessary and not sufficient.
+
+The specification already accepts this shape for one artifact. Section 3.2.5 binds the RAG corpus by `merkle_root` and additionally carries `poisoning_scan`, under normative force: `result: flagged` MUST NOT be issued as `VALID`. `assurance_test` is that pattern applied to artifact #1.
+
+```
+"assurance_test": {
+  "suite_id": "<identifier of the scenario suite>  -- REQUIRED",
+  "suite_version": "<semantic version of the suite>  -- REQUIRED",
+  "harness_version": "<tool-name>/<semver>  -- REQUIRED",
+  "result": "passed | flagged | not-assessed  -- REQUIRED",
+  "assessed_at": "<ISO 8601 UTC>  -- CONDITIONALLY REQUIRED",
+  "scenario_count": "<positive integer>  -- OPTIONAL",
+  "evidence_uri": "<HTTPS URI to the full assessment record>  -- OPTIONAL",
+  "evidence_digest": "sha256:<64-hex-chars>  -- OPTIONAL",
+  "assessed_by": "<SPIFFE URI of the assessing party>  -- OPTIONAL"
+}
+```
+
+Rules:
+
+- A manifest whose `assurance_test.result` is `flagged` MUST NOT be issued as `VALID`. This is the section 3.2.5 rule for `poisoning_scan`, unchanged in substance: an assessment that ran and failed is evidence against the configuration, and carrying it while claiming `VALID` would make the field decorative.
+- `result: not-assessed`, and an absent `assurance_test` block, are permitted at every conformance level in v0.2. A verifier MUST report the distinction rather than collapsing it: section 5.2 defines `configuration_assurance`, so a relying party can tell *approved and assessed* from *approved and unassessed*. Which conformance level, if any, requires an assessment is deliberately left open; see below.
+- `assessed_at` is REQUIRED when `result` is `passed` or `flagged`, and MAY be omitted when `not-assessed`.
+- `harness_version` MUST carry the tool name and a semantic version, format `"<tool-name>/<semver>"`, matching the `scanner_version` rule in 3.2.5. `suite_id` and `suite_version` MUST identify the scenario suite precisely enough that a second party can obtain it; a result whose suite cannot be identified is not reproducible and carries no more weight than `safety_level`.
+- `evidence_digest`, when present, MUST be the digest of the record at `evidence_uri`. A verifier that cannot fetch the record still knows which record was claimed.
+- The block is inside `artifacts` and therefore inside the signing pre-image (3.6). An assessment result outside the signature is one the operator can revise after approval.
+
+What this does not establish. A `passed` result is evidence that a named suite, at a named version, run by a named harness, did not find a violation. It is not proof that the configuration is safe, and the suite's coverage bounds the claim entirely. A relying party MUST treat `passed` as the assertion "this suite found nothing" rather than "nothing is there", which is the same reading 3.2.5 requires of a clean poisoning scan.
+
+Deliberately open. Whether Level 2 conformance should require `result: passed`, as Level 1 already requires a scanned corpus, is a decision about what conformance costs every adopter and is not settled by this section. Until it is settled, an assessment is evidence a deployment may choose to carry, and the verification result reports its absence plainly rather than treating absence as a pass.
+
+#### 3.2.2 Policy Bundle Binding
+
+```
+"policy_bundle": {
+  "hash": "sha256:<64-hex-chars>  -- REQUIRED",
+  "policy_language": "cedar | rego | yaml-agt | composite  -- REQUIRED",
+  "version": "<semantic version>  -- REQUIRED",
+  "enforcement_mode": "enforce | advisory | audit-only  -- REQUIRED",
+  "scope": "<array of AGT policy scope identifiers>  -- OPTIONAL",
+  "agt_version": "<AGT version that produced this bundle>  -- CONDITIONALLY REQUIRED: REQUIRED when policy_language is yaml-agt or composite>",
+  "bound_at": "<ISO 8601 UTC>  -- REQUIRED"
+}
+```
+
+The policy bundle hash covers the complete Cedar policy set, including all policy templates and entity schemas. The `enforcement_mode` field is normative - a verifying party MUST reject a manifest whose `enforcement_mode` is `advisory` when the context requires `enforce`. This field aligns with cMCP's `enforcement_mode` attestation field; section 6.2.1 records how the cMCP runtime and TRACE claim mode names correspond to these values.
+
+For `policy_language: composite`, the `hash` field MUST be a Merkle root over the hashes of each sub-bundle, sorted by policy language identifier in lexicographic order (`cedar`, `rego`, `yaml-agt`). Each sub-bundle MUST be hashed independently using the same hash algorithm as the manifest. The `agt_version` field MUST reference the AGT version used to assemble the composite bundle, even if individual sub-bundles were produced by other tools.
+
+The composite tree is constructed per ADR-0003, and **`leaf_data` for it is the raw digest bytes of each sub-bundle hash**: the bytes the hash algorithm produces, not the `sha256:`-prefixed hex string and not a JSON descriptor. Each leaf is therefore `SHA-256(0x00 || <raw digest bytes>)`. This is normative rather than editorial: all three readings satisfy "a Merkle root over the hashes of each sub-bundle", they produce different roots from identical inputs, and a verifier holding a manifest cannot tell which one it is checking.
+
+AGT policy scope identifiers use the form `<namespace>:<resource-type>:<action>`, e.g., `finance:ledger:write`. For the full scope identifier registry, refer to the AGT specification.
+
+#### 3.2.3 Tool Manifest Binding
+
+> Protocol note: Field values in this section use MCP terminology as the reference implementation. For other protocols, `tool_name` maps to the protocol-native tool identifier and `endpoint_id` maps to the protocol-native server identity. The `rug_pull_policy` field describes a class of attack applicable to any protocol mechanism by which a tool endpoint signals a capability change - not only MCP `notifications/tools/list_changed`.
+
+```
+"tool_manifest": {
+  "catalog_hash": "sha256:<64-hex-chars>  -- REQUIRED",
+  "tools": [
+    {
+      "tool_id": "<reverse-domain tool identifier>  -- REQUIRED",
+      "tool_name": "<protocol-native tool name, e.g. MCP tool name>  -- REQUIRED",
+      "endpoint_id": "<SPIFFE URI of tool endpoint server, e.g. MCP server>  -- REQUIRED",
+      "schema_hash": "sha256:<64-hex-chars>  -- REQUIRED",
+      "description_hash": "sha256:<64-hex-chars>  -- REQUIRED",
+      "version": "<semantic version>  -- REQUIRED",
+      "permission_scope": "<Cedar entity type>  -- OPTIONAL",
+      "egress_destinations": ["<FQDN | IP CIDR>  -- OPTIONAL, empty array means no external egress permitted"]
+    }
+  ],
+  "allow_dynamic_registration": "<boolean -- REQUIRED, default false>",
+  "rug_pull_policy": "deny-and-alert | deny-and-hold | require-reapproval  -- REQUIRED",
+  "bound_at": "<ISO 8601 UTC>  -- REQUIRED"
+}
+```
+
+`catalog_hash` construction
+
+The `catalog_hash` is a Merkle root over per-tool leaf hashes. Each leaf is computed as:
+
+```
+leaf_hash(tool) = SHA-256(0x00 || tool_id_utf8_bytes || 0x00 || schema_hash_bytes || description_hash_bytes)
+```
+
+Tools are sorted lexicographically by `tool_id` before tree construction. Interior nodes use `SHA-256(0x01 || left_child_hash || right_child_hash)` per the RFC 9162 domain-separated construction (see section 4.1). This construction ensures that any mutation of either a tool's schema or its description - the primary MCP tool poisoning attack vector - breaks the `catalog_hash` Merkle root.
+
+A test vector for a two-tool catalog MUST be published in Appendix D of the reference implementation.
+
+`allow_dynamic_registration` MUST be `false` for Level 1+ deployments unless `hitl_record.approvals` contains an approval with `approved_scope.artifacts` including `"tool_manifest"` and an `approval_duration_seconds` covering the dynamic registration window. Any protocol mechanism by which a tool endpoint signals a capability change that adds a tool not in the approved catalog MUST trigger a `rug_pull_policy` action and emit a signed `RUG_PULL_DETECTED` evidence event to the audit log.
+
+`rug_pull_policy` action definitions:
+
+- `deny-and-alert`: Reject the new tool registration. Continue serving previously approved tools. Emit a `RUG_PULL_DETECTED` evidence event (see section 3.2.3.1) to the audit log.
+- `deny-and-hold`: Same as `deny-and-alert`, plus suspend all tool calls until an operator explicitly acknowledges the event. Queue depth is implementation-defined; calls that exceed the queue MUST be rejected with an error surfaced to the agent.
+- `require-reapproval`: Same as `deny-and-hold`, plus initiate the HITL re-approval flow defined in section 3.5.
+
+Tool removal events (where a previously approved tool disappears from the catalog) MUST also trigger the configured `rug_pull_policy` action, as removal of a logging or auditing tool is itself a security event.
+
+`egress_destinations`: An empty array `[]` is the representation for no external egress permitted. The value `"none"` MUST NOT appear as an array element.
+
+##### 3.2.3.1 Dynamic Tool Registration Enforcement
+
+Enforcement responsibility is assigned as follows:
+
+- Phase 2 (cMCP Runtime) deployments: The cMCP Runtime is the enforcement actor for `rug_pull_policy`. It intercepts tool capability change notifications before they reach the agent.
+- Level 0/1 deployments without cMCP: The agent SDK is the enforcement actor. SDK implementations MUST intercept tool capability change events from the underlying protocol transport.
+
+The `RUG_PULL_DETECTED` evidence event is a structured record conforming to a subset of the TRACE envelope (section 6.3.2) with the following additional fields:
+
+```
+{
+  "event_type": "RUG_PULL_DETECTED",
+  "affected_tool_id": "<tool_id of added or removed tool>",
+  "change_type": "addition | removal",
+  "policy_action": "<deny-and-alert | deny-and-hold | require-reapproval>",
+  "detected_at": "<ISO 8601 UTC>",
+  "manifest_id": "<UUID v7 of the current manifest>"
+}
+```
+
+#### 3.2.4 Model Identity Binding
+
+```
+"model_identity": {
+  "provider": "<model provider identifier>  -- REQUIRED",
+  "model_id": "<provider-scoped model identifier>  -- REQUIRED",
+  "version": "<model version or hash>  -- REQUIRED",
+  "capability_level": "<provider-defined capability tier>  -- OPTIONAL",
+  "safety_alignment_version": "<RLHF/Constitutional AI version>  -- OPTIONAL",
+  "quantization": "none | int8 | int4 | fp8 | <other>  -- OPTIONAL",
+  "deployment_type": "api | local | confidential-inference | third-party-api  -- REQUIRED",
+  "model_hash": "sha256:<64-hex-chars> | null  -- CONDITIONALLY REQUIRED",
+  "model_attestation_type": "hash-bound | provider-asserted  -- REQUIRED",
+  "bound_at": "<ISO 8601 UTC>  -- REQUIRED"
+}
+```
+
+`model_hash` is REQUIRED when `deployment_type` is `local` or `confidential-inference` and MUST match the measured binary. `model_hash` MUST be `null` when `deployment_type` is `api` or `third-party-api`. A model version mismatch between the manifest and the running inference service MUST invalidate the manifest.
+
+`model_attestation_type` MUST be set to `hash-bound` when `model_hash` is non-null (local or confidential-inference deployments), and `provider-asserted` when `model_hash` is null (API deployments). Verification results (section 5.2) MUST return `model_identity: "PROVIDER_ASSERTED"` rather than `"MATCH"` when `model_attestation_type` is `provider-asserted`, so that verifiers have an explicit signal that this is a weaker, operator-asserted binding rather than a hardware-rooted one. See section 9.1 for implications on EU AI Act Art. 13 satisfaction.
+
+`deployment_type` value `"third-party-api"` covers API models not served directly by the declared provider (e.g., a model accessed via an intermediary cloud API gateway).
+
+`capability_level` and `safety_alignment_version` are informational fields. For Anthropic models, `capability_level` SHOULD use the provider's published tier identifier (e.g., `"claude-tier-3"`). These fields MUST NOT be used as a security boundary. Verifiers MUST NOT use them as a substitute for `model_hash` or `model_attestation_type`.
+
+#### 3.2.5 RAG Corpus Binding
+
+```
+"rag_corpus": {
+  "corpus_id": "<operator-assigned stable identifier>  -- REQUIRED",
+  "merkle_root": "sha256:<64-hex-chars>  -- REQUIRED",
+  "document_count": "<integer>  -- REQUIRED",
+  "ingestion_policy_hash": "sha256:<64-hex-chars>  -- REQUIRED",
+  "vector_store": "<vector store type and version>  -- REQUIRED",
+  "embedding_model": "<embedding model identifier>  -- REQUIRED",
+  "last_updated": "<ISO 8601 UTC>  -- REQUIRED",
+  "poisoning_scan": {
+    "scanner_version": "<scanner tool name and semver, format: tool-name/x.y.z>  -- REQUIRED for Level 1+",
+    "scanned_at": "<ISO 8601 UTC>  -- REQUIRED for Level 1+",
+    "result": "clean | flagged | not-scanned  -- REQUIRED"
+  },
+  "bound_at": "<ISO 8601 UTC>  -- REQUIRED"
+}
+```
+
+##### 3.2.5.1 Corpus Merkle Tree Construction
+
+The document unit for corpus hashing is the ingestion record as stored in the vector store, defined as the tuple (`document_id`, `content_bytes`). Metadata is excluded from the leaf hash to avoid invalidating the corpus binding on metadata-only changes (e.g., tag updates); instead, the `ingestion_policy_hash` covers the policy governing metadata.
+
+Each leaf hash is computed as:
+
+```
+leaf_hash(doc) = SHA-256(0x00 || document_id_utf8_bytes || 0x00 || content_bytes)
+```
+
+Leaves are sorted lexicographically by their leaf hash value before tree construction. The tree uses a left-balanced binary structure with domain-separated interior nodes:
+
+```
+node_hash = SHA-256(0x01 || left_child_hash || right_child_hash)
+```
+
+This construction is consistent with RFC 9162 Certificate Transparency (see also section 4.1 on domain separation). The `merkle_root` field value MUST use the `sha256:` prefix format.
+
+Poisoning scan rules:
+
+- A manifest with `poisoning_scan.result: flagged` MUST NOT be issued as VALID. The manifest MUST be held in `INCOMPLETE` state until flagged documents are removed and a clean scan completed.
+- For Level 1 conformance and above, `poisoning_scan.result: not-scanned` is NOT permitted. The corpus MUST be scanned before the manifest is signed.
+- For Level 0, `not-scanned` is permitted but MUST surface as a warning in the verification result.
+- `scanner_version` MUST include the scanner tool name and semantic version string in the format `"<tool-name>/<semver>"` (e.g., `"lakera-scan/1.4.2"`). When the CoSAI WS4 scanner registry is established in v0.2, implementations SHOULD reference a registered scanner identifier.
+
+#### 3.2.6 Memory Baseline Binding
+
+```
+"memory_baseline": {
+  "baseline_id": "<UUID v7>  -- REQUIRED",
+  "snapshot_hash": "sha256:<64-hex-chars> | null  -- REQUIRED (null only when memory_type is none)",
+  "memory_type": "none | session | persistent | shared  -- REQUIRED",
+  "store": "<memory store type and version>  -- REQUIRED",
+  "approved_at": "<ISO 8601 UTC>  -- REQUIRED",
+  "ttl_seconds": "<positive integer>  -- CONDITIONALLY REQUIRED",
+  "drift_policy": "deny-on-drift | alert-on-drift | log-only  -- REQUIRED",
+  "shared_memory_owner": "<manifest_id of the agent holding the authoritative snapshot>  -- CONDITIONALLY REQUIRED",
+  "check_interval_seconds": "<positive integer>  -- OPTIONAL",
+  "bound_at": "<ISO 8601 UTC>  -- REQUIRED"
+}
+```
+
+Memory type definitions:
+
+- `none`: The agent has no memory. `ttl_seconds` SHOULD be omitted; `snapshot_hash` MUST be null.
+- `session`: Memory scoped to a single conversation session. Session memory is exempt from drift detection within a session boundary - `snapshot_hash` represents the approved initial state only.
+- `persistent`: Memory that persists across sessions. `snapshot_hash` represents the last approved memory checkpoint.
+- `shared`: Memory state shared across multiple instances of the same agent version, identified by the same `baseline_id`. Each instance MUST reference the same `snapshot_hash`. A designated owner agent MUST hold the authoritative `snapshot_hash`; other agents MUST reference the owner's `manifest_id` in `shared_memory_owner`.
+
+`ttl_seconds` MUST be a positive integer when present. Minimum value: 3600 (1 hour). Maximum value: 7776000 (90 days). REQUIRED when `memory_type` is `persistent` or `shared`.
+
+`drift_policy` conformance: For Level 2 conformance, `drift_policy` MUST be `deny-on-drift` or `alert-on-drift`. `log-only` is permitted only at Level 0 and Level 1.
+
+##### 3.2.6.1 Memory Snapshot and Drift Protocol
+
+`snapshot_hash` is the SHA-256 of the RFC 8785 canonical JSON serialization of the complete memory store key-value map, with keys sorted lexicographically. For non-JSON memory backends (e.g., Redis key-value stores), the implementation MUST export the complete store state as a JSON object before applying RFC 8785 canonicalization.
+
+Drift checks are performed at agent startup (comparing the running store against `snapshot_hash`) and at intervals defined by `check_interval_seconds` if set. Session memory is exempt from drift detection within a session boundary.
+
+For `drift_policy` action definitions:
+
+- `deny-on-drift`: Reject all tool calls and agent actions upon drift detection. Emit a `MEMORY_DRIFT_DETECTED` evidence event to the audit log. Require manual operator acknowledgment before resuming.
+- `alert-on-drift`: Emit a `MEMORY_DRIFT_DETECTED` evidence event. Continue operation but surface the alert in every verification result until acknowledged.
+- `log-only`: Record the drift in the audit log. No operational impact.
+
+##### 3.2.6.2 Memory Checkpoint and Delta Protocol
+
+v0.1 (Section 3.2.6.1) binds memory as a static set snapshot: any change forces a full re-hash and re-approval. v0.2 adds an OPTIONAL incremental path that binds memory as an append-only operation log, a merkle-log (same model as `decision_trace.trace_type: merkle-log`, Section 3.2.7), so an agent may evolve persistent memory across a session and prove the evolution was governed, without re-approving the whole store.
+
+Memory tree. Memory mutations are encoded as an ordered sequence of operations. Each operation is one leaf, appended in sequence order (NOT sorted). The `memory_root` is the RFC 9162 Merkle Tree Hash over the operation leaves, in HashValue form. A leaf is `H(0x00 || tag || canonical_op)` where `tag` domain-separates the representation and `canonical_op` is the RFC 8785 canonical JSON (Section 4.1) of the operation:
+
+- Key-value (`tag = "am-mem-kv\x00"`): `PUT` op `{"key","op","value"}`; `DEL` op `{"key","op"}`.
+- Semantic / vector (`tag = "am-mem-vec\x00"`): `{"content_hash","embedding","embedding_model_id","id","op"}`, where `embedding` is the lowercase-hex of the quantized embedding bytes. Binding the `embedding_model_id` makes a silent re-embedding or re-quantization change the root.
+- Graph (`tag = "am-mem-gnode\x00"` / `"am-mem-gedge\x00"`): node `{"node_id","op","props"}`; edge `{"dst","op","props","rel","src"}`.
+
+`DEL`/removal MUST be encoded as an appended operation; a verifier MUST NOT accept a delta that rewrites or removes an existing log position. The materialized current memory state (and hence the v0.1 `snapshot_hash`, Section 3.2.6.1) is the left fold of the operation log (last-writer-wins for `PUT`/`DEL`).
+
+Checkpoint. A checkpoint binds `{memory_root, tree_size, seq, approved_at, ttl_seconds}` (see `MemoryCheckpointBinding`). `seq` is a strictly monotonic checkpoint counter.
+
+Delta acceptance. A verifier presented with a prior checkpoint, a new checkpoint, and an RFC 9162 §2.1.2 consistency proof MUST accept the advance as a governed checkpoint (NOT drift) if and only if, in this order:
+
+1. the consistency proof verifies that the prior `memory_root` is an append-only positional prefix of the new `memory_root` (RFC 9162 §2.1.4.2);
+1. `new.seq > prev.seq` (else `rollback`);
+1. the new checkpoint is within its TTL window, `now <= new.approved_at + new.ttl_seconds` (else `expired`);
+1. the delta is within the deployer's declared budget (else `budget`).
+
+If step 1 fails, the change is drift and MUST be handled by the existing `drift_policy` (Section 3.2.6.1): `MEMORY_DRIFT_DETECTED`. This preserves the v0.1 fail-closed guarantee: absence of a valid consistency proof never grants acceptance.
+
+Test vector. The KV operation log `[PUT a=1, PUT b=2]` produces `memory_root = sha256:9a41dee8ec223727525f8b26685e413664190d2b82cd62d4f7c15180a9e1f5af`. The single-operation prefix `[PUT a=1]` has leaf preimage `am-mem-kv\x00{"key":"a","op":"PUT","value":1}` and leaf hash `sha256:f2904e572018f088488c4fbd2e5fffaa3bc5f94488eec27ca73f4d1348595b91`; its consistency proof to the 2-operation log is the single node `42effb8d6d6bf9904585248b30b039a5ede7a447a5f8fd21cc0a8b0b850c566f`. Implementations MUST reproduce these values.
+
+Scope. A governed checkpoint advance establishes integrity, ordering, freshness and budget. It does not establish that retrieval behaviour over the new memory state remained acceptable, and nothing in this protocol assesses it. A checkpoint can satisfy every rule above while an appended correction stays less salient than the fact it corrects, while authorized additions displace a safety or identity anchor, while memory from another role or tenant becomes retrievable, or while states that should retrieve differently collapse to the same context. None of those requires a forged signature, a rewritten checkpoint, an expired TTL, or an invalid consistency proof. Assessing them is a separate evidence artifact over a pinned retriever and probe suite, out of scope for this specification and tracked in [agent-manifest#298](https://github.com/agentrust-io/agent-manifest/issues/298).
+
+Limitations (v0.2). Log compaction / checkpoint re-baseline is not yet defined: a deployment MUST re-baseline (full re-approval per Section 3.2.6.1) before the cumulative operation count approaches implementation limits. HITL co-signing of a checkpoint advance and `shared` memory owner co-signing are deferred to a later revision.
+
+#### 3.2.7 Decision Trace Binding
+
+```
+"decision_trace": {
+  "trace_type": "hash-chained | merkle-log",
+  "audit_chain_root": "sha256:<64-hex-chars>",
+  "audit_chain_uri": "<HTTPS URI to audit log endpoint>",
+  "signing_key_id": "<TEE-sealed key identifier>",
+  "audit_key_sealed": true,
+  "first_entry_at": "<ISO 8601 UTC>",
+  "last_entry_at": "<ISO 8601 UTC>",
+  "entry_count": "<integer>",
+  "bound_at": "<ISO 8601 UTC>"
+}
+```
+
+| Field              | Cardinality | Notes                                                                                                                                       |
+| ------------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trace_type`       | REQUIRED    | `hash-chained` for sequential ECDSA-P256 chains; `merkle-log` for tree-based logs                                                           |
+| `audit_chain_root` | REQUIRED    | SHA-256 root of the entire audit chain as of manifest signing time                                                                          |
+| `audit_chain_uri`  | REQUIRED    | HTTPS endpoint where the full audit chain can be fetched for verification                                                                   |
+| `signing_key_id`   | REQUIRED    | Identifier of the TEE-sealed key that signs each audit entry                                                                                |
+| `audit_key_sealed` | REQUIRED    | MUST be `true` for Level 1+ conformance. A value of `false` indicates a software-signed chain and MUST be treated as software-attested only |
+| `first_entry_at`   | REQUIRED    | Timestamp of the first entry in the chain; used to detect chain truncation                                                                  |
+| `last_entry_at`    | REQUIRED    | Timestamp of the most recent entry at manifest signing time                                                                                 |
+| `entry_count`      | OPTIONAL    | Total number of entries in the chain; allows verifiers to detect entry deletion                                                             |
+| `bound_at`         | REQUIRED    | When this binding was captured                                                                                                              |
+
+This object is a commitment to the audit-chain state observed at manifest signing time, not an embedded account of decisions the agent will make later. Section 3.2.7.1 defines how a verifier checks that a chain served later is an append-only extension of that commitment. Per-invocation decisions produced after `bound_at` MUST travel as separate TRACE envelopes or equivalent runtime evidence. A verifier MUST use the manifest identifier, agent identity, signing-key binding, and chain continuity to join those records to this baseline. A valid signature on a later record proves that record was not altered; it does not by itself prove that the record is complete or faithful to every action that occurred.
+
+The `audit_chain_root` in this binding MUST match the `audit_chain_root` field in the cMCP attestation report (Section 6.2), or the running root MUST be shown to descend from it by the continuity protocol in Section 3.2.7.1. A difference that is neither an exact match nor a proven append-only extension indicates the manifest was signed against a different audit chain than the one currently running, which MUST cause verification to return MISMATCH.
+
+`audit_key_sealed: false` does not invalidate the manifest but MUST be surfaced in the verification result as a warning. A verifying party that requires hardware-rooted evidence (e.g., Level 1+ conformance, regulatory audit) MUST treat `audit_key_sealed: false` as equivalent to NOT_BOUND for attestation purposes.
+
+##### 3.2.7.1 Audit Chain Checkpoint and Continuity
+
+Section 3.2.7 binds the audit chain as a snapshot root at signing time. Decisions are produced after signing. `entry_count` lets a verifier detect deletion *below* the signed count, but nothing above the signed root is constrained: a verifier fetching the chain at T+n can confirm it is internally consistent and still contains the signed root, and cannot distinguish an append-only extension from a chain rebuilt around that prefix. Section 3.2.6.2 already solves exactly this problem for the other artifact that grows after signing. This subsection applies the same mechanism to the audit chain.
+
+A checkpoint binds `{audit_chain_root, tree_size, seq, observed_at, ttl_seconds}` (see `AuditCheckpointBinding`). The checkpoint signed into the manifest is `decision_trace.audit_chain_root` with `entry_count` as its `tree_size`, observed at `bound_at`. `seq` is a strictly monotonic checkpoint counter.
+
+```
+"audit_checkpoint": {
+  "audit_chain_root": "sha256:<64-hex-chars>  -- REQUIRED",
+  "tree_size": "<integer>  -- REQUIRED (entries for hash-chained, leaves for merkle-log)",
+  "seq": "<integer>  -- REQUIRED (strictly monotonic)",
+  "observed_at": "<ISO 8601 UTC>  -- REQUIRED",
+  "ttl_seconds": "<integer 60..7776000>  -- REQUIRED",
+  "checkpoint_signature": "<signature by the TEE-sealed audit key>  -- OPTIONAL"
+}
+```
+
+Entry leaves. An entry leaf is `H(0x00 || "am-trace-entry\x00" || canonical_entry)`, where `canonical_entry` is the RFC 8785 canonical JSON (Section 4.3) of the audit entry. The tag domain-separates a trace entry from a memory operation or a corpus document that canonicalizes to the same bytes.
+
+Continuity evidence. The shape depends on the signed `trace_type`, and the verifier MUST use the `trace_type` bound in the manifest rather than one asserted at fetch time.
+
+- `merkle-log`: an RFC 9162 §2.1.2 consistency proof between the signed root and the current root. O(log n), verified from the two roots and the two tree sizes alone. The tree is the RFC 9162 Merkle Tree Hash over entry leaves in append order (NOT sorted).
+- `hash-chained`: the ordered entry leaves appended after the signed position. The verifier folds them forward from the signed root: `chain_i = H(0x02 || chain_{i-1} || leaf_i)`, with `chain_0 = leaf_0` and the empty chain equal to `H("")`. O(n). A sequential chain admits no logarithmic proof; a linear proof is the honest alternative to no proof. `0x02` is used rather than the RFC 9162 internal-node byte `0x01` so that a sequential root can never be read as a merkle root over the same entries.
+
+Acceptance. A verifier presented with the signed checkpoint, a current checkpoint, and continuity evidence MUST accept the advance as continuous if and only if, in this order:
+
+1. the current `tree_size` is not below the signed `tree_size`, the signed `tree_size` is non-zero, and both roots use the same hash algorithm;
+1. the continuity evidence verifies that the signed root is an append-only prefix of the current root (RFC 9162 §2.1.4.2 for `merkle-log`; the forward fold above for `hash-chained`);
+1. `current.seq >= signed.seq`, and if the sizes differ then `current.seq > signed.seq` (else `rollback`);
+1. the current checkpoint is within its TTL window, `now <= observed_at + ttl_seconds` (else `expired`).
+
+If step 2 fails, the running chain is not demonstrably the chain the manifest was signed against. The verifier MUST return `MISMATCH` for `decision_trace`, which is the treatment Section 3.2.7 already requires when the signed and running roots disagree. Absence of continuity evidence never grants acceptance: a diverged root with no proof is `MISMATCH`, not a warning.
+
+Unlike a memory delta there is no budget stage. An audit chain is expected to grow without bound, so a growth ceiling would be a constraint the artifact cannot honestly carry.
+
+Scope. A verified consistency proof establishes that no entry below the current head was rewritten or removed. It does not establish that every action the agent took produced an entry. Completeness of the record against real behaviour is out of scope for this specification (Section 7.2), and a continuity proof MUST NOT be presented as evidence of it.
+
+Test vectors. Three entries, canonicalized per Section 4.3, where entry *i* is `{"decision":"allow","seq":i,"tool":"kyc.lookup"}`:
+
+| Value                         | Digest                                                                    |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| leaf 0                        | `60254cf11420c61e878667adc185b683d261a19e9c74da5d224687758db65267`        |
+| leaf 1                        | `933612cc73106c049a8b4c4ea20103c997d26f9ff45f4eda83eac569f0c82cf5`        |
+| leaf 2                        | `d2a1bd03e6ea0d31241263f59252f5fab5f4f9a6625c8b89c90d0d116b17d441`        |
+| `hash-chained` root at size 2 | `sha256:0d313a1b8e77e6f1c7a585f99ca9c877f75dd6876229c2164d25694df3f3f0ba` |
+| `hash-chained` root at size 3 | `sha256:ce399e52ed691feeb4703b1b259d4ef166350b6a23363209943e2a57276990bb` |
+| `merkle-log` root at size 2   | `sha256:478f71a93107b464fedfb132180fe3b881ee09950aaace2aeced2e4fdb59b406` |
+| `merkle-log` root at size 3   | `sha256:4974beaa3bbe693aa96414258aec1854551edcabd564108f4485e0bed4cc3ddb` |
+
+The `merkle-log` consistency proof from size 2 to size 3 is the single node `d2a1bd03e6ea0d31241263f59252f5fab5f4f9a6625c8b89c90d0d116b17d441`; the `hash-chained` evidence for the same advance is leaf 2. Implementations MUST reproduce these values.
+
+Limitations (v0.2). Checkpoint co-signing by the TEE-sealed audit key is OPTIONAL (`checkpoint_signature`), so a checkpoint served without one is authenticated only by the transport and by the proof itself. Chain compaction and re-baselining are not defined: a deployment MUST re-sign the manifest against a new `audit_chain_root` rather than re-base a chain in place.
+
+#### 3.2.8 Supply Chain Binding
+
+```
+"supply_chain": {
+  "container_image_digest": "sha256:<64-hex-chars>  -- REQUIRED",
+  "base_image_digest": "sha256:<64-hex-chars>  -- OPTIONAL",
+  "slsa_provenance": {
+    "builder_id": "<URI: runDetails.builder.id from the SLSA attestation>  -- REQUIRED",
+    "subject_digest": "sha256:<64-hex-chars>  -- REQUIRED, must match container_image_digest>",
+    "provenance_uri": "<URI to the DSSE envelope or OCI referrer>  -- REQUIRED",
+    "rekor_entry_id": "<Rekor entry UUID for signature verification>  -- REQUIRED for Level 2+",
+    "declared_level": "1 | 2 | 3 | 4  -- OPTIONAL, non-normative operator declaration"
+  },
+  "sbom": {
+    "format": "cyclonedx | spdx  -- REQUIRED",
+    "schema_version": "<SBOM specification schema version, e.g. CycloneDX 1.6 or SPDX 2.3>  -- REQUIRED",
+    "document_id": "<CycloneDX serialNumber URN or SPDX documentNamespace URI>  -- REQUIRED",
+    "sbom_hash": "sha256:<64-hex-chars>  -- REQUIRED",
+    "sbom_uri": "<URI to SBOM document>  -- REQUIRED"
+  },
+  "mcp_servers": [
+    {
+      "server_id": "<SPIFFE URI>  -- REQUIRED",
+      "image_digest": "sha256:<64-hex-chars>  -- REQUIRED",
+      "slsa_level": "1 | 2 | 3 | 4  -- REQUIRED",
+      "phase2_attested": "<boolean>  -- REQUIRED",
+      "sbom": {
+        "format": "cyclonedx | spdx  -- OPTIONAL",
+        "schema_version": "<SBOM specification schema version>  -- OPTIONAL",
+        "document_id": "<CycloneDX serialNumber URN or SPDX documentNamespace URI>  -- OPTIONAL",
+        "sbom_hash": "sha256:<64-hex-chars>  -- OPTIONAL",
+        "sbom_uri": "<URI to SBOM document>  -- OPTIONAL"
+      }
+    }
+  ],
+  "bound_at": "<ISO 8601 UTC>  -- REQUIRED"
+}
+```
+
+The `container_image_digest` is the primary supply chain binding for the agent runtime. It MUST match the hardware measurement in the TEE attestation report. The `mcp_servers` array binds the supply chain identity of each connected MCP server - `phase2_attested` (JSON boolean) indicates whether the server is running inside a TEE with its own hardware attestation (Phase 2 / cMCP server-side).
+
+The `slsa_provenance.declared_level` field is non-normative and represents the operator's declared SLSA level summary. The actual SLSA level is determined by the `builder_id` value in the referenced DSSE attestation envelope. Verifiers MUST fetch and validate the DSSE envelope at `provenance_uri` - the manifest binding is a pointer to the attestation, not a substitute for it.
+
+The `sbom.document_id` field MUST be set to the `serialNumber` URN for CycloneDX format documents, or the `documentNamespace` URI for SPDX format documents. The `sbom.schema_version` field refers to the SBOM specification schema version (e.g., `"CycloneDX 1.6"`, `"SPDX 2.3"`), not a document revision number.
+
+### 3.3 Hardware Attestation Binding
+
+The attestation block binds the manifest to a specific TEE hardware measurement. It is produced by the the Confidential Runtime at agent launch time and is not part of the draft manifest - it is appended after the TEE measurement is complete.
+
+```
+"attestation": {
+  "platform": "amd-sev-snp | intel-tdx | nvidia-blackwell | aws-nitro | arm-cca | google-confidential-space  -- REQUIRED",
+  "tee_version": "<platform firmware version>  -- REQUIRED",
+  "measurement": "<platform-specific launch measurement - see section 3.3.1 for per-platform format>  -- REQUIRED",
+  "manifest_hash_in_report": "sha256:<64-hex-chars>  -- REQUIRED",
+  "policy_bundle_hash": "sha256:<64-hex-chars>  -- REQUIRED",
+  "enforcement_mode": "enforce | advisory | audit-only  -- REQUIRED",
+  "audit_chain_root": "sha256:<64-hex-chars>  -- REQUIRED for Level 1+",
+  "audit_key_sealed": "<boolean>  -- REQUIRED",
+  "container_image_digest": "sha256:<64-hex-chars>  -- REQUIRED",
+  "report_timestamp": "<ISO 8601 UTC>  -- REQUIRED",
+  "report_uri": "<URI to full platform attestation report>  -- REQUIRED",
+  "attestation_service": {
+    "service_id": "<SPIFFE URI of the attestation service>  -- REQUIRED",
+    "service_measurement": "<TEE measurement of attestation service itself>  -- REQUIRED",
+    "verification_endpoint": "<HTTPS URI>  -- REQUIRED"
+  }
+}
+```
+
+`manifest_hash_in_report` pre-image
+
+The `manifest_hash_in_report` pre-image is the RFC 8785 canonical JSON serialization of the full manifest document including the `signature` block and excluding only the `attestation` block. The `attestation` key MUST NOT be present in the pre-image document. The `transparency_log_entry` key MUST also be absent from the pre-image (it is populated after log submission). The hash MUST be computed over the UTF-8 encoding of this canonical form with no BOM.
+
+Because the pre-image covers the `signature` block, re-signing a manifest changes its `manifest_hash_in_report` even when no artifact value changed. An attestation carried forward onto a re-signed document therefore binds the previous document, not the one being verified.
+
+A verifier that finds an `attestation` block whose `manifest_hash_in_report` does not equal the hash computed above MUST return `MISMATCH`, whether or not `enforce_attestation` is set. `enforce_attestation` governs whether an attestation is *required*; it does not govern whether a wrong one counts. An absent attestation and a present attestation that binds a different manifest are different conditions: the first is a policy question and the second is a report about some other document.
+
+The `audit_key_sealed` field (JSON boolean) MUST be `true` for production deployments. It indicates that the audit log signing key was generated inside the TEE and has never been exported to operator-readable memory. A manifest with `audit_key_sealed: false` MUST be treated as software-attested and MUST NOT satisfy regulatory requirements that call for hardware-rooted evidence.
+
+Attestation verification protocol
+
+The attestation service acts as a RATS Verifier in the sense of RFC 9334. For deployments where a third party wishes to verify TEE measurements independently (without trusting the attestation service as intermediary), the service MUST produce a normalized attestation result in the form of an Entity Attestation Token (EAT, per RFC 9528) derived from the raw platform report. The `report_uri` provides the raw platform report for parties wishing to perform independent verification using platform vendor SDKs (AMD `sev-snp-verify`, Intel TDX Attest SDK, etc.).
+
+##### 3.3.1 Platform Attestation Profiles
+
+The following profiles define, per platform, the measurement field used to carry the `manifest_hash_in_report`, the format of the `measurement` field, and which component performs the extension.
+
+AMD SEV-SNP
+
+- `manifest_hash_in_report` is bound via the `HOST_DATA` field of the SNP attestation report (32 bytes). `HOST_DATA` is host-supplied launch data: it is set by the host/launcher (the Confidential Runtime) at `SNP_LAUNCH_FINISH` and the guest can read but not modify it after launch. This boot-time binding is therefore only as trustworthy as the launcher that measures the manifest. `HOST_DATA` is NOT the guest-controlled field; the guest-controlled field is `REPORT_DATA` (64 bytes), used for the runtime freshness proofs in §3.3.2. Do NOT use a PCR register for this purpose.
+- `measurement` field: SHA-256 of initial guest memory pages (64 bytes, 128 lowercase hex characters).
+- Extension actor: the Confidential Runtime (host/launcher) sets `HOST_DATA` at `SNP_LAUNCH_FINISH`, before the guest runs; the guest cannot alter it.
+
+Intel TDX
+
+- `manifest_hash_in_report` is extended into `RTMR[3]` using `TDG.MR.RTMR.EXTEND` before any workload code runs.
+- `measurement` field: MRTD value (SHA-384, 96 bytes, 192 lowercase hex characters). For deployments using multiple RTMRs, the `measurement` field MUST be a JSON object: `{"mrtd": "<hex>", "rtmr0": "<hex>", "rtmr1": "<hex>", "rtmr2": "<hex>", "rtmr3": "<hex>"}`.
+- Extension actor: the Confidential Runtime performs the RTMR extension.
+
+AWS Nitro
+
+- `manifest_hash_in_report` is extended into PCR15 using `tpm2_extend` with SHA-256 bank before instance launch. PCR15 is reserved for custom measurements and MUST be used.
+- `measurement` field: A JSON object of PCR index to SHA-384 hex values: `{"pcr0": "<hex>", "pcr1": "<hex>", "pcr15": "<hex>"}`. At minimum, PCR0, PCR1, and PCR15 MUST be present.
+- Extension actor: Instance bootloader extends PCR15; the Confidential Runtime verifies the extension before proceeding.
+
+NVIDIA Blackwell
+
+- `manifest_hash_in_report` is embedded in the SPDM measurements report as custom measurement index `0x05` (implementation-reserved, distinct from NVIDIA firmware indices 0x00-0x04).
+- `measurement` field: SPDM measurement digest as provided by the NVIDIA attestation SDK (format per NVIDIA Hopper/Blackwell attestation documentation).
+- Extension actor: the Confidential Runtime writes the custom measurement index before attestation report generation.
+
+ARM CCA
+
+- `manifest_hash_in_report` is extended into the Realm Measurement Register (RMR) at index 1 using `RSI_MEASUREMENT_EXTEND` before workload execution.
+- `measurement` field: Realm measurement register value (SHA-512, 64 bytes, 128 lowercase hex characters).
+- Extension actor: Realm Management Monitor (RMM) applies the extension; the Confidential Runtime initiates via RSI call.
+
+Google Confidential Space
+
+- Google Confidential Space uses AMD SEV-SNP as the underlying TEE. The AMD SEV-SNP profile applies. Additionally, the `measurement` field MUST include the Confidential Space-specific `sub_mod` claims from the OIDC token issued by the Confidential Space attestation service.
+- Extension actor: As per AMD SEV-SNP profile.
+
+##### 3.3.2 Runtime Attestation Reports (Freshness Proofs)
+
+The `attestation` block defined in Section 3.3 is a boot-time artifact. It proves which manifest was active when the TEE was initialised. It does not prove that the agent's runtime state (system prompt, policy bundle, tool catalog) has remained unchanged after launch.
+
+For deployments requiring continuous or challenge-response evidence, the SDK exposes `attest_runtime_state(nonce, context_hash)`, which produces a Runtime Attestation Report, a separate evidence artifact that is never appended to the manifest.
+
+Scope of the TEE boot measurement
+
+The TEE boot measurement (`MEASUREMENT` on SNP, `MRTD` on TDX, PCR values on TPM) is hardware-immutable after launch. No re-measurement of the TEE is possible. What `attest_runtime_state()` provides is a fresh hardware-signed quote in which the guest-controlled field (`REPORT_DATA` on SNP, `REPORTDATA` on TDX) is set to a value that binds the nonce and the current runtime context. The hardware signs both the immutable boot measurement and this caller-supplied value, giving the verifier:
+
+1. TEE identity: the boot measurement has not changed since the boot-time `attestation` block was produced
+1. Current state: the caller-supplied field encodes `sha256(nonce || context_hash_bytes)`
+1. Freshness: a verifier-supplied nonce prevents replay of an older quote
+
+REPORT_DATA derivation (normative)
+
+The caller-controlled field MUST be set to:
+
+```
+caller_data = sha256(nonce || bytes.fromhex(context_hash_hex))
+```
+
+where `context_hash` is a `sha256:<hex>` digest of the RFC 8785 canonical JSON of the runtime context object:
+
+```
+{
+  "policy_bundle_hash":  "sha256:<hex>",
+  "system_prompt_hash":  "sha256:<hex>",
+  "tool_catalog_hash":   "sha256:<hex>"
+}
+```
+
+Additional fields (`model_version`, `rag_corpus_merkle_root`, `memory_snapshot_hash`) MAY be included. Field names MUST be sorted lexicographically. The hash MUST be over the UTF-8 encoding of the canonical form with no BOM.
+
+Runtime Attestation Report fields
+
+| Field              | Type             | Description                                                 |
+| ------------------ | ---------------- | ----------------------------------------------------------- |
+| `platform`         | string           | Same values as `attestation.platform`                       |
+| `report_data_hash` | string           | `sha256:` + SHA-256 of `caller_data` above                  |
+| `context_hash`     | string           | The `sha256:<hex>` context hash supplied by the caller      |
+| `nonce_hex`        | string           | Hex encoding of the verifier-supplied nonce                 |
+| `quote`            | bytes (optional) | Raw platform quote blob for hardware signature verification |
+
+Verification
+
+A verifier MUST:
+
+1. Confirm `report_data_hash == sha256(sha256(nonce || context_hash_bytes))` using `verify_runtime_report()` or equivalent. A report that fails this check MUST be rejected.
+1. Confirm that the boot measurement in the raw `quote` blob matches the `measurement` field in the manifest's `attestation` block. A mismatch indicates the runtime report was produced in a different TEE than the one that was originally attested.
+1. Optionally verify the hardware signature in `quote` using the platform vendor SDK (`amd sev-snp-verify`, Intel TDX Attest SDK, `tpm2_checkquote`).
+
+What runtime attestation does not prove
+
+A Runtime Attestation Report does not prove that the values in `context_hash` are correct; it proves only that the agent claimed this context hash in a TEE with the specified boot measurement at the moment the nonce was signed. The verifier is responsible for independently computing the expected `context_hash` from the live artifacts and comparing it against `report.context_hash`.
+
+Scheduling
+
+The frequency of `attest_runtime_state()` calls is not mandated by this standard. Verifiers that require freshness guarantees SHOULD supply a new nonce per challenge and require a response within a bounded time window. When a runtime report is used in the same decision as a section 5.1.2 verification challenge, its nonce MUST be the domain-separated derivation of that challenge given in 5.1.2 rule 6, so the two freshness domains cannot be replayed independently of one another. The SDK provides the primitive; scheduling and enforcement are the responsibility of the caller or a runtime enforcement layer (e.g., cMCP).
+
+TPM note
+
+`attest_runtime_state()` on `TPMProvider` requires a pre-provisioned Attestation Key (AK) passed at construction time. See the SDK documentation for provisioning steps. SEV-SNP and TDX do not have this requirement.
+
+### 3.4 A2A Delegation Chain
+
+> Standards note: The delegation chain defined in this section is an original design in this specification with no dependency on any published A2A wire protocol standard. As of the date of this specification, no published A2A standard defines a delegation chain, scope grant format, or inter-agent trust primitive. This specification intends to align the delegation chain with A2A as that standard matures. Section 10.4 notes the relationship accurately.
+
+When an agent is spawned by another agent in a multi-agent system, the delegating agent's identity and scope grant must be bound in the manifest. The `delegation_chain` array is ordered from root principal (human or system) to the current agent.
+
+```
+"delegation_chain": [
+  {
+    "hop": "<integer, 0-indexed>  -- REQUIRED",
+    "principal_type": "human | system | agent  -- REQUIRED",
+    "principal_id": "<SPIFFE URI (for system or agent) | OIDC subject URI | email URI | W3C DID (for human)>  -- REQUIRED",
+    "delegated_at": "<ISO 8601 UTC>  -- REQUIRED",
+    "scope_grant": {
+      "tools": ["<tool_id>  -- OPTIONAL"],
+      "data_classifications": ["public | internal | confidential | restricted  -- OPTIONAL"],
+      "max_delegation_depth": "<positive integer>  -- OPTIONAL, default 3>",
+      "ttl_seconds": "<positive integer>  -- OPTIONAL",
+      "constraints": ["<Cedar permit or forbid statement>  -- OPTIONAL"]
+    },
+    "delegation_signature": "<Ed25519 | ML-DSA-65 signature by principal>  -- REQUIRED",
+    "principal_manifest_id": "<manifest_id of delegating agent, if agent>  -- CONDITIONALLY REQUIRED",
+    "principal_attestation_hash": "<attestation hash of delegating agent, if attested>  -- OPTIONAL"
+  }
+]
+```
+
+##### 3.4.1 Scope Grant Semantics
+
+Constraints are strictly restrictive - they can only narrow the scope granted at the previous hop, never extend it. The effective permission set for hop N is the intersection of the scope granted at hop N-1 and the constraints at hop N. A child agent MUST NOT use the constraint mechanism to claim permissions not granted by its parent - this structural property prevents scope laundering.
+
+Constraints are evaluated using the Cedar entity store and schema from the `policy_bundle` bound in the root manifest of the delegation chain. Each element of `scope_grant.constraints` MUST be a syntactically complete Cedar `permit` or `forbid` statement with explicit `principal`, `action`, and `resource` slots - not a fragment. A verifier MUST reject a delegation chain where any constraint references an entity type not present in the root `policy_bundle` schema.
+
+Verifying parties that support Cedar MUST parse and evaluate each constraint. Verifying parties that do not support Cedar MUST treat a non-empty `constraints` array as `UNVERIFIABLE` and MUST surface this in the verification result rather than treating it as `VALID`.
+
+If `max_delegation_depth` is omitted from a `scope_grant`, verifying parties MUST apply a default value of 3. A `max_delegation_depth` of 0 means no further delegation is permitted. Verifying parties MUST count delegation hops from the root and MUST reject chains whose depth exceeds the `max_delegation_depth` of the root scope_grant.
+
+The delegation chain is the cryptographic primitive that closes the post-hoc accountability gap - the absence of a tamper-evident proof of the full delegation chain from human principal through orchestrator to tool call. Each hop must be signed by the delegating principal's key. The `scope_grant` at each hop may only be a subset of the scope granted at the previous hop - scope laundering is structurally prevented because each hop's scope is signed by the granting agent.
+
+### 3.5 Human-in-the-Loop Approval Records
+
+For agents operating under EU AI Act Article 14 requirements or any policy that mandates human oversight, the `hitl_record` block captures human approval events in a cryptographically bound, non-repudiable form.
+
+```
+"hitl_record": {
+  "required": "<boolean>  -- REQUIRED",
+  "approvals": [
+    {
+      "approval_id": "<UUID v7>  -- REQUIRED",
+      "approver_id": "<OIDC subject URI | email URI (mailto:) | W3C DID>  -- REQUIRED",
+      "approver_identity_type": "oidc | email | did  -- REQUIRED",
+      "approver_oidc_issuer": "<OIDC issuer URI>  -- CONDITIONALLY REQUIRED when approver_identity_type is oidc",
+      "approver_role": "<role identifier>  -- REQUIRED",
+      "approved_at": "<ISO 8601 UTC>  -- REQUIRED",
+      "approved_scope": {
+        "artifacts": ["system_prompt", "policy_bundle", "tool_manifest", "...  -- REQUIRED"],
+        "risk_tier": "low | medium | high | critical  -- REQUIRED",
+        "approval_duration_seconds": "<positive integer>  -- REQUIRED",
+        "conditions": ["<human-readable condition string>  -- OPTIONAL"]
+      },
+      "approval_signature": "<Ed25519 | ML-DSA-65 signature by approver key>  -- REQUIRED",
+      "approval_method": "hardware-key | software-key | mfa-backed  -- REQUIRED",
+      "evidence_uri": "<URI to full approval audit record>  -- REQUIRED"
+    }
+  ],
+  "escalation_policy": {
+    "trigger": "<Cedar policy fragment defining escalation conditions>  -- OPTIONAL",
+    "escalation_target": "<SPIFFE URI of escalation authority>  -- OPTIONAL",
+    "timeout_action": "deny | suspend | alert  -- REQUIRED when escalation_policy is present"
+  },
+  "hitl_runtime": {
+    "interrupt_endpoint": "<HTTPS URI for stopping or suspending the running agent>  -- REQUIRED for Level 2+",
+    "override_mechanism": "kill-signal | suspend-and-hold | require-confirmation  -- REQUIRED for Level 2+",
+    "monitoring_endpoint": "<HTTPS URI for real-time operation status>  -- REQUIRED for Level 2+",
+    "automation_bias_disclosure": "<URI to Art. 14(4)(c) automation bias disclosure document>  -- OPTIONAL"
+  }
+}
+```
+
+`approver_id` MUST be a human-attributable identity. SPIFFE SVIDs MUST NOT be used as `approver_id` values - SPIFFE SVIDs identify machine workloads, not natural persons. The preferred form is an OIDC `sub` claim paired with an `approver_oidc_issuer` URI (e.g., `sub: "1234567890"` + `iss: "https://accounts.google.com"`), an email address as a URI (`mailto:approver@example.com`), or a W3C DID bound to a hardware authenticator. For EU AI Act Art. 14 compliance, the approver identity MUST be traceable to a natural person in the deployer's HR or IAM system.
+
+`risk_tier` is assigned on the reversibility and operational-boundary axis below. It is not an operator's estimate of likelihood or severity and MUST NOT be lowered because an action is routine. The approver MUST assign the highest tier of any action permitted by the approved scope or its bound policy:
+
+| Tier       | Falsifiable assignment rule                                                                                                                                                                              |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `low`      | The scope permits no durable external effect. Its effects are confined to the evaluated system and disappear when the operation ends or can be withdrawn completely without a compensating action.       |
+| `medium`   | The scope permits a durable effect, but the effect remains wholly within the deployer's control and can be withdrawn completely by that deployer.                                                        |
+| `high`     | The scope permits an effect outside the deployer's control, but a documented external or compensating action can reverse the effect.                                                                     |
+| `critical` | The scope permits an effect that cannot be fully recalled or reversed after execution, including an external party acting on released information or an irreversible safety, legal, or financial action. |
+
+If the permitted actions span tiers, the highest tier applies. If reversibility or the operational boundary cannot be established from the bound policy, tool catalog, and approval evidence, the approver MUST use `critical`. A verifier proves only that the declared tier and approval method were signed and satisfy the mechanical ordering below; it does not infer that the tier is truthful. A reviewer or deployment policy compares the declaration with the bound capabilities. A `VALID` result therefore MUST NOT be represented as proof that the tier assignment was correct.
+
+`approval_method` trust ordering for regulatory compliance:
+
+- `hardware-key` (FIDO2 passkey, HSM, or smartcard): satisfies EU AI Act Art. 14 non-repudiation requirements. REQUIRED for `risk_tier: high` or `critical` at Level 2 conformance.
+- `mfa-backed` (software key protected by MFA): acceptable for `low` or `medium` at Level 2 conformance.
+- `software-key`: acceptable only for Level 0 non-regulated deployments.
+
+At Level 2, a verifier MUST return `APPROVAL_INSUFFICIENT` when any otherwise-current approval uses `software-key`, or when a `high` or `critical` approval uses anything other than `hardware-key`. The overall result MUST be `MISMATCH`. Level 0 records the declared method without making a regulatory-strength claim; Level 1 deployments define their minimum method in relying-party policy.
+
+`approval_duration_seconds` bounds the window in which an approval may be presented, not the period for which the reasoning behind it remains sound. Expiry and admissibility are separate questions: an approval can run out while nothing it relied on has changed, and it can remain unexpired after the basis on which it was given has ceased to hold. A verifier evaluating `approved_at + approval_duration_seconds > now` establishes only that the approval is within its declared window. It does not establish that the approval is still applicable, and a `VALID` result therefore MUST NOT be represented as proof that the grounds for the approval still obtain.
+
+`hitl_runtime` block declares the runtime human oversight capabilities required by EU AI Act Art. 14(4) operational oversight obligations. The `hitl_record.approvals` structure satisfies Art. 14 pre-deployment documentation obligations (Art. 14(4)(b)-(e)). The `hitl_runtime` block separately addresses the runtime stop/override capability requirement (Art. 14(4)(a)). Both are required for full Art. 14 compliance. See section 9.1 for the regulatory mapping.
+
+Each `approval_signature` is produced by the approver's hardware-backed key (FIDO2/passkey at minimum, HSM for high-risk approvals).
+
+### 3.6 Manifest Signature
+
+```
+"signature": {
+  "algorithm": "Ed25519 | ML-DSA-65 | hybrid-Ed25519-ML-DSA-65  -- REQUIRED",
+  "key_id": "<key identifier>  -- REQUIRED",
+  "key_type": "software | hsm | tee-sealed  -- REQUIRED",
+  "signed_at": "<ISO 8601 UTC>  -- REQUIRED",
+  "signed_fields": ["@context", "@type", "manifest_id", "previous_manifest_id", "agent_id", "agent_instance_id", "version", "min_verifier_version", "issued_at", "expires_at", "issuer", "crypto_profile", "profile", "unbound_artifacts", "source_bundle", "artifacts", "delegation_chain", "hitl_record", "prior_transparency_log_entry", "log_retention", "data_scope", "operational_lifecycle", "intent"],
+  "signature_value": "<base64url-encoded signature over RFC 8785 canonical JSON>  -- CONDITIONALLY REQUIRED: REQUIRED when algorithm is Ed25519 or ML-DSA-65",
+  "classical_signature": "<base64url-encoded Ed25519 signature>  -- CONDITIONALLY REQUIRED: REQUIRED when algorithm is hybrid-Ed25519-ML-DSA-65",
+  "pq_signature": "<base64url-encoded ML-DSA-65 signature>  -- CONDITIONALLY REQUIRED: REQUIRED when algorithm is hybrid-Ed25519-ML-DSA-65"
+}
+```
+
+`signed_fields` is a fixed normative list and MUST NOT be varied by implementations. The following table enumerates every top-level manifest field and states whether it is part of the signing pre-image. A field marked "Signed" that is absent from the manifest (an omitted OPTIONAL or CONDITIONALLY REQUIRED field) is simply omitted from the pre-image per the null-omission rule in section 2.3; it MUST NOT be serialized as `null`.
+
+Signing coverage table (normative)
+
+| Top-level field                | In signing pre-image                        | Notes                                                                                                                                                                                                                     |
+| ------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@context`                     | Signed                                      | Treated as an ordinary JSON string field (section 2.3). Binding it prevents post-signing context substitution.                                                                                                            |
+| `@type`                        | Signed                                      | Treated as an ordinary JSON string field (section 2.3).                                                                                                                                                                   |
+| `manifest_id`                  | Signed                                      |                                                                                                                                                                                                                           |
+| `previous_manifest_id`         | Signed                                      | Binds re-issuance audit chain continuity.                                                                                                                                                                                 |
+| `agent_id`                     | Signed                                      |                                                                                                                                                                                                                           |
+| `agent_instance_id`            | Signed                                      | The instance this manifest governs (section 6.4.2). An instance identity outside the signature is one an operator can retarget after the fact, which is precisely the correlation a runtime-evidence consumer depends on. |
+| `version`                      | Signed                                      |                                                                                                                                                                                                                           |
+| `min_verifier_version`         | Signed                                      | Prevents post-signing downgrade of the required verifier version.                                                                                                                                                         |
+| `issued_at`                    | Signed                                      |                                                                                                                                                                                                                           |
+| `expires_at`                   | Signed                                      |                                                                                                                                                                                                                           |
+| `issuer`                       | Signed                                      |                                                                                                                                                                                                                           |
+| `crypto_profile`               | Signed                                      |                                                                                                                                                                                                                           |
+| `profile`                      | Signed                                      | Prevents stripping the `composition-only` limitation.                                                                                                                                                                     |
+| `unbound_artifacts`            | Signed                                      | Prevents rewriting which artifacts the issuer explicitly did not bind.                                                                                                                                                    |
+| `source_bundle`                | Signed                                      | Binds the package format and digest from which the manifest was derived.                                                                                                                                                  |
+| `artifacts`                    | Signed                                      |                                                                                                                                                                                                                           |
+| `attestation`                  | NOT signed                                  | Appended post-signing by hardware (section 3.3).                                                                                                                                                                          |
+| `delegation_chain`             | Signed                                      |                                                                                                                                                                                                                           |
+| `hitl_record`                  | Signed, with `approvals` normalized to `[]` | See the normalization rule below. The HITL requirement itself is tamper-evident; approvals attach post-issuance.                                                                                                          |
+| `prior_transparency_log_entry` | Signed                                      | Known at issuance time: it references the previous manifest's log entry (section 2.2). Binds the key rotation chain.                                                                                                      |
+| `log_retention`                | Signed                                      | Prevents post-signing weakening of the declared retention policy (section 8.1).                                                                                                                                           |
+| `data_scope`                   | Signed                                      | Prevents post-signing alteration of declared GDPR processing scope (section 9.3).                                                                                                                                         |
+| `operational_lifecycle`        | Signed                                      | Prevents post-signing alteration of Art. 13 lifecycle disclosures (section 9.4).                                                                                                                                          |
+| `intent`                       | Signed                                      | The declared intent must be the issuer's, not the running agent's (section 3.9). An intent outside the signature is one any downstream party can rewrite, which would make the field decorative.                          |
+| `signature`                    | NOT signed                                  | The signing object itself.                                                                                                                                                                                                |
+| `transparency_log_entry`       | NOT signed                                  | Populated after log submission (see ordering rules below).                                                                                                                                                                |
+
+Every top-level field defined by this specification appears in exactly one row of this table. A future spec version that introduces a new top-level field MUST add it to this table.
+
+`hitl_record.approvals` normalization rule (normative): When computing the manifest signing pre-image, the value of `hitl_record.approvals` MUST be normalized to an empty array (`[]`). All other `hitl_record` fields, including `required`, `escalation_policy`, `hitl_runtime`, and any risk-tier metadata, are covered by the issuer signature as-is. This makes the HITL *requirement* tamper-evident (an attacker cannot strip or weaken it without invalidating the issuer signature) while allowing approvals to be attached after the manifest is issued, without re-signing. Approval entries are individually authenticated by their own `approval_signature` and verified separately per section 3.5; they are NOT covered by the issuer signature. Verifiers MUST apply the identical normalization before checking the issuer signature. See ADR-0006 (as amended 2026-06-11).
+
+Canonical serialization: The signature covers the RFC 8785 canonical JSON serialization of the named `signed_fields`, after applying the `hitl_record.approvals` normalization rule above. See section 2.3 for the complete canonicalization specification.
+
+Envelope note: this is a detached signature over a canonical-JSON pre-image, not a JWS or COSE structure. Per ADR-0011 the envelope moves to COSE_Sign1 in v0.2, for alignment with RFC 9943 (SCITT); that envelope is specified in [agent-manifest-cose-envelope-v0.2.md](https://manifest.agentrust-io.com/spec/agent-manifest-cose-envelope-v0.2/index.md). The change is gated on the manifest `version` field: this section stays normative for v0.1 manifests, which continue to verify unchanged after v0.2 ships.
+
+Algorithm binding (normative): the `signature` block is not part of the pre-image, so `signature.algorithm` is not covered by the signature. A verifier MUST therefore check the declared algorithm against the signed `crypto_profile` and MUST reject a manifest whose signature is weaker than the declared profile requires: a `post-quantum` manifest presented with a classical-only Ed25519 signature is a downgrade and MUST NOT verify (section 4.2). A signature stronger than the declared profile requires (for example ML-DSA-65 or hybrid under a `standard` profile) is permitted. A verifier MUST reject an unrecognized algorithm identifier rather than defaulting to Ed25519.
+
+Ed25519 validation rules : Ed25519 implementations MUST use the cofactorless verification equation (`[S]B == R + [k]A`). Implementations MUST reject non-canonically encoded points (i.e., reject if the encoding does not round-trip through point decoding). Implementations MUST NOT use batch verification unless the batch verifier enforces the same cofactorless equation with canonical encoding checks. Implementations SHOULD use hedged signing (per draft-irtf-cfrg-det-sigs-with-noise) when signing keys reside in hardware signers subject to fault injection.
+
+Hybrid signature envelope : When `algorithm` is `hybrid-Ed25519-ML-DSA-65`, both `classical_signature` and `pq_signature` MUST be present. Both signatures cover the identical RFC 8785 canonical JSON byte sequence of `signed_fields`. A verifier MUST verify both signatures and MUST reject the manifest if either fails. Reference: draft-ietf-pquip-hybrid-signature-spectrums for the binding model.
+
+Transparency log submission ordering : The `transparency_log_entry` is a top-level manifest field (see section 3.1) that is NOT part of `signed_fields` and is NOT covered by the `signature`. The correct signing and submission flow is:
+
+1. Canonicalize and sign the `signed_fields` to produce the `signature` object.
+1. Submit the signed manifest (without `transparency_log_entry`) to the transparency log.
+1. Receive the inclusion proof from the log.
+1. Populate the top-level `transparency_log_entry` field.
+1. The manifest is complete and ready for use only after step 4.
+
+In hosted mode, the attestation service is responsible for log submission. In self-hosted mode, the signing CLI is responsible.
+
+Transparency log entry format :
+
+```
+"transparency_log_entry": {
+  "log_id": "<SHA-256 fingerprint of the log's public key>  -- REQUIRED",
+  "log_index": "<integer position in the log>  -- REQUIRED",
+  "entry_uuid": "<Rekor entry UUID>  -- REQUIRED",
+  "integrated_time": "<Unix epoch integer>  -- REQUIRED",
+  "inclusion_proof": {
+    "checkpoint": "<signed tree head>  -- REQUIRED",
+    "hashes": ["<sha256 hex tile hashes>  -- REQUIRED"],
+    "tree_size": "<integer>  -- REQUIRED"
+  }
+}
+```
+
+The `log_id` MUST be the SHA-256 fingerprint of the log's public key, consistent with the Rekor v2 API and the Sigstore root of trust document. The `integrated_time` Unix epoch timestamp is required to enable verifiers to check that the signing event occurred before certificate expiry and to detect backdated signatures.
+
+All production Agent Manifest implementations MUST publish to a public or consortium transparency log. The signature is NOT sufficient without the `transparency_log_entry` for regulatory purposes.
+
+### 3.7 Revocation
+
+Revocation is distinct from natural expiry. Natural expiry (the `expires_at` timestamp is exceeded) produces an `EXPIRED` verification result. Explicit revocation produces a `REVOKED` verification result. A verifier MUST check the revocation status endpoint before returning `VALID`.
+
+Revocation record schema:
+
+```
+{
+  "revocation_id": "<UUID v7>  -- REQUIRED",
+  "manifest_id": "<UUID v7 of the revoked manifest>  -- REQUIRED",
+  "agent_id": "<SPIFFE URI>  -- REQUIRED",
+  "revoked_at": "<ISO 8601 UTC>  -- REQUIRED",
+  "reason_code": "KEY_COMPROMISE | ARTIFACT_CHANGE | POLICY_VIOLATION | SCHEDULED_ROTATION | AGENT_DECOMMISSION | OTHER  -- REQUIRED",
+  "reason_text": "<human-readable description>  -- OPTIONAL",
+  "scope": "manifest | agent  -- REQUIRED",
+  "revocation_signature": "<Ed25519 | ML-DSA-65 signature by manifest issuer key or successor key>  -- REQUIRED",
+  "transparency_log_entry": "<transparency log entry object per section 3.6>  -- REQUIRED"
+}
+```
+
+`scope` values:
+
+- `manifest`: Revokes only the specific `manifest_id`. Prior manifests for the same `agent_id` are unaffected.
+- `agent`: Revokes all current and future manifests for the `agent_id`. Used after key compromise where all historical manifests for the agent are considered untrusted.
+
+Revocation endpoints:
+
+```
+POST /revoke
+Content-Type: application/json
+Body: <revocation record>
+
+GET /revocation-status?manifest_id=<UUID v7>
+Returns: <revocation record> if revoked, 404 if not revoked
+```
+
+Revocation records MUST be published to the same transparency log as the manifest, using a leaf type of `revocation`. The `transparency_log_entry` in the revocation record confirms non-repudiation of the revocation event.
+
+### 3.8 Key Rotation and Manifest Re-signing
+
+When the signing key is rotated, the manifest MUST be re-signed and re-published to the transparency log. The old manifest becomes invalid once the new manifest is published and the old key is revoked.
+
+Key rotation procedure:
+
+1. Generate new key pair
+1. Create a new manifest with the same artifact bindings, a new `issued_at`, and updated `signature.key_id`
+1. Sign the new manifest with the new private key
+1. Publish to transparency log
+1. Update the verification endpoint to serve the new manifest
+1. Revoke the old manifest via the revocation endpoint
+1. Revoke the old signing key in the key management system
+
+Implementations MUST NOT re-use the old `manifest_id` for the rotated manifest - a new UUID v7 MUST be generated. The old manifest_id MAY be referenced in the new manifest's metadata for continuity tracing.
+
+### 3.9 Declared Intent
+
+An OPTIONAL top-level `intent` object states what the agent is for.
+
+```
+"intent": {
+  "statement": "<what this agent is for>  -- REQUIRED, non-empty>"
+}
+```
+
+**The issuer declares it, and that is the entire point.** Runtime governance frameworks increasingly ask that an action be evaluated against the agent's stated intent. An intent the governed agent asserts about itself cannot support that: an agent that intends to do X declares X, and the check becomes a formality. Because `intent` is inside the signing pre-image (section 3.6), it is fixed by the issuing authority before the agent runs, and the running agent can neither choose nor revise it. A verifier that finds an intent which does not match the issuer's signature has found tampering, not a change of plan.
+
+`intent` MUST be covered by the issuer signature. An implementation MUST NOT accept an `intent` supplied outside the signed manifest — for example on a per-call request field — as satisfying this section, because such a value is self-asserted by the party being governed.
+
+**One field, and no stored digest.** A consumer that needs a stable reference to the intent, such as a runtime binding it into a per-call receipt, derives it as the `sha256:` digest of the RFC 8785 canonical form of the whole `intent` object. That digest is computed on demand and MUST NOT be stored inside the manifest beside the statement: two representations of one value can be made to disagree, and the signature already makes the statement tamper-evident.
+
+**Compatibility.** `intent` is OPTIONAL, and a manifest that omits it is unaffected. Per the null-omission rule in section 2.3 and the signing coverage table in section 3.6, a signed field absent from the manifest is omitted from the pre-image rather than serialized as `null`, so every signature issued before this section existed verifies unchanged.
+
+#### 3.9.1 What this does not provide
+
+This section defines an input, not an analysis. It specifies no way to measure whether an action is *semantically* consistent with the declared intent, and an implementation MUST NOT present the presence of `intent` as evidence that such a measurement was performed.
+
+Measuring semantic distance from a stated intent requires comparing meaning, which needs a model, and the trustworthiness of that comparison then depends on which model ran and whether its execution was itself attested. That is out of scope here and is deliberately left unclaimed rather than approximated. A structural proxy — scope overlap, tool category distance — is not a semantic measure and MUST NOT be labelled as one.
+
+What the field does give is a signed, pre-execution statement of purpose that a verifier can read, bind to a receipt, and compare across manifests for the same agent.
+
+## 4. Cryptographic Protocols
+
+### 4.1 Standard Profile
+
+The standard cryptographic profile uses the following primitives:
+
+| Operation                     | Algorithm                                                                                         | Key Size                                                   | Notes                                                                                                                                                                                                                                                                                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manifest signature            | Ed25519                                                                                           | 256-bit                                                    | EdDSA over Curve25519. Cofactorless verification required - see section 3.6.                                                                                                                                                                                                                                                                                   |
+| Artifact hashing              | SHA-256                                                                                           | 256-bit output                                             | MUST use NFC-normalized UTF-8 for text artifacts. Hash values prefixed with `sha256:`.                                                                                                                                                                                                                                                                         |
+| Merkle tree (corpus, catalog) | SHA-256 with RFC 9162 domain separation                                                           | 256-bit                                                    | Leaf: `SHA-256(0x00 \|\| leaf_data)`. Node: `SHA-256(0x01 \|\| left \|\| right)`. See section 4.1.1.                                                                                                                                                                                                                                                           |
+| Canonical JSON serialization  | RFC 8785 (JCS)                                                                                    | N/A                                                        | Applies to all signing, hashing, and Merkle construction. See section 2.3.                                                                                                                                                                                                                                                                                     |
+| Agent identity                | SPIFFE SVID (X.509)                                                                               | P-256 EC (preferred); RSA-2048 (legacy compatibility only) | New implementations SHOULD use P-256. RSA-2048 permitted only when interfacing with existing PKI that does not support EC.                                                                                                                                                                                                                                     |
+| Attestation binding           | Platform-native (AMD, Intel, NVIDIA, ARM, AWS)                                                    | Platform-defined                                           | See section 3.3.1 for per-platform measurement formats.                                                                                                                                                                                                                                                                                                        |
+| Transport encryption          | TLS 1.3 with attestation extensions per draft-fossati-tls-attestation-08 (or superseding version) | P-256 or X25519                                            | Mutual attestation over TLS per cMCP spec. Note: attestation TLS extensions are not yet an RFC; implementations MUST track the latest IETF RATS WG draft. Until the RFC is finalized, transport attestation is RECOMMENDED rather than REQUIRED for Level 0/1 deployments. A fallback of attestation over application-layer HTTPS is acceptable for Level 0/1. |
+| Transparency log              | Rekor (Sigstore) or compatible                                                                    | N/A                                                        | RFC 9162 Certificate Transparency variant.                                                                                                                                                                                                                                                                                                                     |
+
+##### 4.1.1 Merkle Tree Domain Separation
+
+All Merkle tree constructions in this specification MUST use the RFC 9162 / RFC 6962 domain-separated hashing convention:
+
+- Leaf hash: `SHA-256(0x00 || leaf_data)`, where `leaf_data` is defined by the section specifying that construction.
+- Interior node hash: `SHA-256(0x01 || left_child_hash || right_child_hash)`.
+
+The `0x00` and `0x01` domain separation prefixes prevent second-preimage attacks that are possible with plain Merkle-Damgard SHA-256 trees lacking domain separation (as demonstrated in the Certificate Transparency literature). This construction is referenced in RFC 9162 Section 2.1.
+
+An empty tree (zero items) has a defined root of `SHA-256(empty_string)` encoded as `sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+
+For the post-quantum profile, replace SHA-256 with SHAKE-256(256-bit output) throughout.
+
+### 4.2 Post-Quantum Profile
+
+For deployments requiring post-quantum security (classified government, financial services with >10 year sensitivity horizon, sovereign deployments), the post-quantum profile MUST be used. This aligns with AGT's existing ML-DSA-65 implementation.
+
+| Operation          | Algorithm                  | NIST Standard | Notes                                                                                          |
+| ------------------ | -------------------------- | ------------- | ---------------------------------------------------------------------------------------------- |
+| Manifest signature | ML-DSA-65                  | FIPS 204      | Replaces Ed25519. Larger signatures (~3.3KB) but quantum-resistant.                            |
+| Key exchange       | ML-KEM-768                 | FIPS 203      | Replaces X25519 in attestation TLS handshake.                                                  |
+| Artifact hashing   | SHAKE-256 (256-bit output) | FIPS 202      | Extendable output function; replaces SHA-256. Hash values prefixed with `shake256:`.           |
+| Hybrid mode        | Ed25519 + ML-DSA-65        | Both          | Transition period: both signatures required and verified. See section 3.6 for hybrid envelope. |
+
+The `crypto_profile` field in the manifest header MUST be set to `post-quantum` when using this profile. A verifying party that supports only the standard profile MUST reject a post-quantum manifest rather than silently falling back - this prevents downgrade attacks during the transition period.
+
+"Reject" here means returning `UNVERIFIABLE`, not `MISMATCH` and not an error. A verifier that lacks post-quantum support cannot appraise the signature at all, so it has established nothing about the manifest, which may be perfectly valid; reporting `MISMATCH` would assert a defect the verifier has not observed. This is the same distinction section 5.2 already draws for a verifier that lacks the key material to check a signature. A verifier MUST NOT raise an error to the caller in this case: a manifest is untrusted input, and a verification request MUST produce a verification result. `INCOMPATIBLE_VERSION` is reserved for unsupported *specification* versions (section 2.4) and MUST NOT be used to signal an unsupported algorithm.
+
+Level 3 transparency log note : As of the date of this specification (June 2026), the public Sigstore/Rekor instance does not yet support ML-DSA-65 signatures. Level 3 deployments MUST use a private Sigstore instance or an equivalent CT-log that supports ML-DSA-65. The parameter set used in the log's dual-signing MUST be documented and pinned by the implementation. As an alternative for the transition period, a separate PQ-signed transparency log entry in DSSE format alongside a classical Rekor entry is acceptable. Level 3 deployments MUST document their transparency log configuration in the `transparency_log_entry.log_id` field.
+
+### 4.3 Canonical Serialization
+
+All canonical JSON serialization in this specification uses RFC 8785 (JSON Canonicalization Scheme, JCS). Implementations MUST NOT use JSON-LD RDNA normalization, ad-hoc sorted-key serialization, or any other canonicalization standard.
+
+#### Scope
+
+| Use                                 | Input                                                                                                                                                      |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manifest signature pre-image        | Fields in `signed_fields` (excludes `attestation`, `signature`, `transparency_log_entry`), with `hitl_record.approvals` normalized to `[]` per section 3.6 |
+| `manifest_hash_in_report` pre-image | Full draft manifest JSON before attestation block appended                                                                                                 |
+| Memory snapshot hash                | Memory baseline JSON object                                                                                                                                |
+| Evidence pack hash                  | Evidence pack JSON envelope                                                                                                                                |
+| Merkle tree leaf nodes (JSON)       | Per-entry JSON in audit chain and corpus                                                                                                                   |
+
+Text artifacts (`system_prompt`, policy content) are hashed as raw UTF-8 NFC byte sequences, not as JSON.
+
+#### Null-valued optional fields
+
+Optional fields with a `null` value MUST be excluded from the canonical form. Implementations MUST NOT serialize `"field": null` into the signature pre-image.
+
+#### JSON-LD fields
+
+`@context` and `@type` are treated as ordinary JSON string fields under RFC 8785. Full JSON-LD normalization is NOT used.
+
+#### Normative requirement
+
+Implementations MUST reject manifests where the manifest signature does not verify under RFC 8785 canonicalization. Fallback to alternative canonicalization on failure is NOT permitted.
+
+References: RFC 8785 (https://www.rfc-editor.org/rfc/rfc8785) | Test vector: Appendix D
+
+## 5. Verification Protocol
+
+### 5.1 Verification Endpoint
+
+An Agent Manifest implementation MUST expose a verification endpoint that accepts a manifest ID or manifest document and returns a structured verification result. The endpoint MUST be reachable from any relying party without prior operator-controlled authentication.
+
+```
+POST /verify
+Content-Type: application/json
+{
+  "manifest_id": "<UUID v7>  -- REQUIRED",
+  "challenge_nonce": "<hex, at least 128 bits of CSPRNG output>  -- OPTIONAL, REQUIRED for a freshness-dependent decision",
+  "verification_context": {
+    "purpose": "tool-call | audit | delegation | regulatory  -- REQUIRED",
+    "verifier_id": "<SPIFFE URI of verifying party>  -- OPTIONAL",
+    "required_fields": ["system_prompt", "policy_bundle", "tool_manifest"],
+    "enforce_hitl": "<boolean>  -- OPTIONAL, default false",
+    "approver_public_keys": "<object mapping approver_id to trusted base64url Ed25519 public key>  -- REQUIRED when a HITL approval is evaluated",
+    "enforce_attestation": "<boolean>  -- OPTIONAL, default false",
+    "min_slsa_level": "1 | 2 | 3 | 4  -- OPTIONAL"
+  }
+}
+```
+
+##### 5.1.1 Endpoint Hosting Models
+
+Two conformant hosting models are defined:
+
+SDK-hosted mode: The agent SDK exposes the verification endpoint locally within the agent process. The endpoint returns hashes of running artifacts (not the artifacts themselves) computed by a trusted component inside the agent process. Access is restricted by mTLS using the agent's SPIFFE SVID. The "without prior operator-controlled authentication" requirement means that a regulator or third-party auditor must be able to reach the endpoint using their own SPIFFE SVID - the operator MUST NOT be able to gate this access.
+
+hosted mode: The agent SDK pushes signed hash attestations of running artifacts to the attestation service at startup and on change. The verification endpoint serves verification results using these pushed hashes. The push protocol uses the agent's SPIFFE SVID for authentication to the attestation service. Third-party verifiers access the verification endpoint without prior operator involvement.
+
+Conformance level requirements:
+
+- Level 0/1: Either hosting model is acceptable.
+- Level 2+: hosted mode is REQUIRED, or SDK-hosted mode with TEE-sealed attestation of the running hash state.
+
+##### 5.1.2 Challenge and Context Binding
+
+`verification_id` is generated by the verification service and `verified_at` is a producer-selected timestamp. Neither is evidence that a result was produced for a particular relying party's live request, so a signed `VALID` result is replayable: to a different relying party, for a different `purpose`, against a weaker context than the one now being asked for, or after runtime state has changed but before a local age heuristic expires. Section 3.3.2 already defines a verifier-supplied nonce for the separate Runtime Attestation Report. These rules carry the same challenge into the main result and compose the two freshness domains.
+
+1. A relying party whose decision depends on freshness MUST supply `challenge_nonce`: at least 128 bits from a cryptographically secure generator, used once. A verification service MUST echo it unchanged in the result.
+1. The result MUST carry `verification_context_hash`, the `sha256:` digest of the RFC 8785 canonical JSON of the `verification_context` object as received. Every context input that affected the decision MUST be inside that object, including `purpose`, `verifier_id`, `required_fields`, `enforce_hitl`, `enforce_attestation`, and `min_slsa_level`. An implementation with additional decision-affecting inputs MUST include them; one that silently drops an input from the hash is asserting a decision it did not make.
+1. `challenge_nonce` is echoed as its own field and is NOT an input to `verification_context_hash`. The relying party compares the nonce directly; keeping it out of the hash lets two requests that ask the same question produce the same context hash, which is what makes the hash comparable across requests.
+1. `verification_signature` MUST cover the whole result, `challenge_nonce` and `verification_context_hash` included. A signature over a result whose nonce is outside it authenticates the verdict and not the question.
+1. A relying party that supplied a challenge MUST reject a result unless: `challenge_nonce` equals its outstanding challenge; that challenge has not already been consumed; and the response arrived within a locally bounded acceptance window. It MUST also recompute `verification_context_hash` from the context it sent and reject a mismatch. A `verified_at` timestamp chosen by the producer MUST NOT be treated as satisfying the freshness check on its own.
+1. When `enforce_attestation` is `true` and a Runtime Attestation Report (section 3.3.2) is used in the same decision, the report's nonce MUST be derived from the same challenge rather than chosen independently:
+
+```
+runtime_nonce = sha256("am-runtime-nonce" || challenge_nonce_bytes)
+```
+
+Domain separation keeps the derived value from being usable as a verification challenge in its own right. A report whose nonce is not this derivation is evidence about some other challenge, and the two freshness domains are then not composed: an attacker who can replay either one independently has defeated both.
+
+A service that receives no `challenge_nonce` returns a result without one, and a relying party reading such a result knows it is unbound to any request. That is a conformant answer to an unauthenticated question, not a freshness guarantee, and section 5.3 says what it may be relied on for.
+
+### 5.2 Verification Result Schema
+
+```
+{
+  "verification_id": "<UUID v7>  -- REQUIRED",
+  "manifest_id": "<UUID v7>  -- REQUIRED",
+  "verified_at": "<ISO 8601 UTC>  -- REQUIRED",
+  "challenge_nonce": "<hex, echoed unchanged from the request>  -- REQUIRED when the request carried one",
+  "verification_context_hash": "sha256:<64-hex-chars>  -- REQUIRED",
+  "result": "VALID | MISMATCH | EXPIRED | REVOKED | INCOMPLETE | ATTESTATION_UNAVAILABLE | INCOMPATIBLE_VERSION  -- REQUIRED",
+  "attestation_verified": "<boolean>  -- REQUIRED",
+  "fields_verified": {
+    "system_prompt": "MATCH | MISMATCH | NOT_BOUND  -- REQUIRED",
+    "policy_bundle": "MATCH | MISMATCH | NOT_BOUND  -- REQUIRED",
+    "tool_manifest": "MATCH | MISMATCH | NOT_BOUND  -- REQUIRED",
+    "model_identity": "MATCH | PROVIDER_ASSERTED | MISMATCH | NOT_BOUND  -- REQUIRED",
+    "rag_corpus": "MATCH | MISMATCH | NOT_BOUND  -- REQUIRED",
+    "memory_baseline": "MATCH | MISMATCH | NOT_BOUND | EXPIRED  -- REQUIRED",
+    "decision_trace": "MATCH | EXTENDED | MISMATCH | NOT_BOUND  -- REQUIRED",
+    "supply_chain": "MATCH | MISMATCH | NOT_BOUND  -- REQUIRED",
+    "delegation_chain": "VALID | INVALID | NOT_PRESENT | UNVERIFIABLE  -- REQUIRED",
+    "hitl_record": "APPROVED | EXPIRED | NOT_REQUIRED | MISSING | APPROVAL_INSUFFICIENT | INVALID | UNVERIFIABLE  -- REQUIRED"
+  },
+  "configuration_assurance": "PASSED | FLAGGED | NOT_ASSESSED  -- REQUIRED",
+  "mismatch_details": [
+    {
+      "field": "<field name>",
+      "expected_hash": "<hash in manifest>",
+      "actual_hash": "<hash of running artifact>",
+      "delta_detected_at": "<ISO 8601 UTC>"
+    }
+  ],
+  "correlation": {
+    "agent_uid": "<the manifest agent_id>  -- REQUIRED when agent_id is present",
+    "agent_instance_uid": "<the manifest agent_instance_id, or null>  -- REQUIRED",
+    "manifest_id": "<UUID v7>  -- REQUIRED"
+  },
+  "evidence_pack": {
+    "trace_id": "<TRACE envelope ID>",
+    "signed_by": "<TEE-sealed key identifier>",
+    "pack_hash": "sha256:<64-hex-chars>",
+    "pack_uri": "<URI to full evidence pack>"
+  },
+  "verification_signature": "<Ed25519 | ML-DSA-65 signature by the attestation service>"
+}
+```
+
+`model_identity` returns `PROVIDER_ASSERTED` when `model_attestation_type` is `provider-asserted` (i.e., `model_hash` is null for API-deployed models), so verifiers have an explicit signal distinguishing hardware-rooted model identity from an operator assertion. See section 3.2.4.
+
+`decision_trace` returns `EXTENDED` when the running `audit_chain_root` is not the root signed at `bound_at` but continuity evidence proves the signed root is an append-only prefix of it, per Section 3.2.7.1. `EXTENDED` is a passing result and does not make the overall result `MISMATCH`; it is reported distinctly from `MATCH` so a relying party can tell an unmoved chain from a proven extension. A diverged root with absent, malformed, or failing continuity evidence returns `MISMATCH`.
+
+`delegation_chain` returns `UNVERIFIABLE` when any `scope_grant.constraints` element is a non-empty array of Cedar statements and the verifier does not support Cedar evaluation - rather than treating the chain as `VALID`.
+
+`configuration_assurance` reports the state of `system_prompt.assurance_test` (section 3.2.1.1): `PASSED` when an assessment ran and found no violation, `FLAGGED` when one ran and did, and `NOT_ASSESSED` when the block is absent or carries `not-assessed`. `FLAGGED` MUST cause the overall result to be `MISMATCH`. `NOT_ASSESSED` does not affect the overall result in v0.2 and is reported so that a relying party can tell an assessed configuration from an unassessed one rather than inferring a pass from silence.
+
+`hitl_record` returns `APPROVAL_INSUFFICIENT` when an approval exists but does not meet the `approval_method` requirement for the declared `risk_tier` (e.g., `software-key` approval on a `high` risk tier operation at Level 2).
+
+`hitl_record` returns `INVALID` when an approval's own signature is malformed or does not verify over the current `manifest_id`, `approver_id`, `approved_at`, and exact `approved_scope`. It returns `UNVERIFIABLE` when the verifier has no trusted public key for the approval's `approver_id`. Neither state permits an overall `VALID` result. A manifest or COSE signature does not authenticate approval entries, which attach after issuance and MUST be verified independently.
+
+`challenge_nonce` and `verification_context_hash` bind a result to the request that produced it; see section 5.1.2 for how a relying party checks them and why a `verified_at` timestamp is not a substitute.
+
+The `correlation` object is what a consumer joins this result to runtime evidence with, so the two identities and the exact manifest they came from travel together rather than being reassembled by the consumer. It is always present when the input contains the REQUIRED `agent_id`; a verifier reporting malformed input that omits `agent_id` cannot construct it. `agent_instance_uid` is `null` on a manifest that governs more than one run; see section 6.4.2 for what a producer does in that case.
+
+`ATTESTATION_UNAVAILABLE` is returned when the hardware attestation service cannot be reached and the verification cannot be completed. Verifiers receiving this result MUST NOT treat it as `VALID`.
+
+`INCOMPATIBLE_VERSION` is returned when the verifier does not support the manifest's declared `version`. See section 2.2 for version negotiation rules.
+
+##### 5.2.1 Evidence Pack Format
+
+An evidence pack is a JSON document with the following structure:
+
+```
+{
+  "manifest": "<the full manifest document>",
+  "verification_result": "<the section 5.2 verification result object>",
+  "trace_envelopes": ["<array of TRACE envelope objects for the session or invocation>"],
+  "attestation_report": "<raw platform attestation report bytes, base64url-encoded>"
+}
+```
+
+`pack_hash` is the SHA-256 of the RFC 8785 canonical JSON of this document. The pack is signed using the TEE-sealed key, with the signature appended as a top-level `pack_signature` field in the same detached form as the manifest `signature` object (section 3.6).
+
+Access control for confidential payloads: Tool call payload fields in TRACE envelopes MUST be replaced with their SHA-256 hashes in packs served to unauthenticated verifiers. Full payloads are available only to verifiers presenting a valid SPIFFE SVID with an authorized role declared in the manifest's `policy_bundle`.
+
+### 5.3 Verification Semantics
+
+A `VALID` result means all of the following are true:
+
+- The manifest signature is valid under RFC 8785 canonicalization and the manifest is present in the transparency log. Before checking the issuer signature, the verifier MUST apply the `hitl_record.approvals` normalization rule from section 3.6 (replace `hitl_record.approvals` with `[]` in the signing pre-image); approvals are verified separately against their own `approval_signature`s
+- Receipt presence alone MUST NOT satisfy the transparency-log condition. A verifier MUST authenticate the receipt or inclusion evidence against its configured Transparency Service trust policy. In particular, a receipt carried in a COSE unprotected header is untrusted input until that independent appraisal succeeds.
+- The TEE attestation report confirms the manifest hash is bound to the hardware measurement
+- All fields specified in `required_fields` match their running artifacts. For `decision_trace`, `EXTENDED` satisfies this condition and `MISMATCH` does not; see Section 3.2.7.1
+- The manifest has not expired
+- The manifest has not been revoked (revocation status endpoint MUST be checked before returning VALID)
+- If `enforce_hitl` is `true`, at least one HITL approval is present, valid, not expired, and meets the `approval_method` requirement for the declared `risk_tier`
+- If `enforce_attestation` is `true`, `audit_key_sealed` is `true` in the attestation block
+
+A `VALID` result that carries no `challenge_nonce` is a statement about the manifest at the moment the service evaluated it, and nothing binds it to any particular request. It MAY be relied on for a decision whose correctness does not depend on freshness, such as an audit reading of a historical manifest. It MUST NOT be relied on to gate an action, because a result that is not bound to a live challenge is one an attacker may present again later. See section 5.1.2.
+
+A `MISMATCH` result means at least one required field does not match its running artifact. The `mismatch_details` array MUST enumerate every mismatched field. A relying party receiving a `MISMATCH` MUST NOT proceed with the operation that triggered verification.
+
+##### 5.3.2 What `VALID` does not establish
+
+`VALID` establishes that the agent presenting this manifest is the agent that was approved, running the artifacts that were approved, unexpired and unrevoked. It is a statement about provenance, not about permission.
+
+A relying party MUST NOT treat `VALID` as authorization for the action that triggered verification. Specifically, `VALID` does not establish any of the following:
+
+- that the specific call about to be made is permitted. `tool_manifest.catalog_hash` pins which tools were approved and detects mutation of their definitions. Inside one authorized tool, a read and an irreversible write are the same tool, and nothing in this specification bounds the arguments a call may carry;
+- that the action is within the consequence envelope a human approver had in mind. `risk_tier` (section 3.5) describes the approval given at issuance, not the action being attempted now;
+- that the agent's current inputs are trustworthy. Section 7.2 keeps prompt injection out of scope, and a manifest that verifies is fully compatible with an agent being misled.
+
+Authorization is the policy layer's question, and the manifest is one of its inputs: a gateway evaluates its own policy over the call, with `VALID` as the precondition establishing which agent is asking rather than as the answer. A gateway that proceeds on `VALID` alone has an identity check where it needed an access decision.
+
+Stating this is not a narrowing of scope. It is what the specification already does: `delegation_chain` returns `UNVERIFIABLE` rather than `VALID` when a Cedar constraint cannot be evaluated, and `hitl_record` returns `APPROVAL_INSUFFICIENT` when an approval does not meet the bar for its `risk_tier`. Both refuse to let an unevaluated condition become a pass. The rule above says the same thing about the overall result, which had a defined behaviour on `MISMATCH` and none on `VALID`.
+
+##### 5.3.3 Issuer Key Authorization
+
+A verifier MUST NOT return `VALID` unless the signing key is authorized for the manifest's declared `issuer` through a trust path the verifier can evaluate independently of the manifest document itself.
+
+Before verifying the signature, a verifier MUST:
+
+1. resolve the signing key through a defined authorization path external to the manifest document; and
+1. confirm that the resolved key is authorized for the declared `issuer`.
+
+The verifier MUST complete both steps before signature verification. A verifier that cannot complete either step MUST NOT return `VALID`.
+
+1. A verifier MUST reject a signing key that is not resolved through a defined authorization path. The key identifier in the signature envelope identifies a key. It does not authorize one. For v0.1 manifests, `signature.key_id` is unauthenticated metadata outside the signing pre-image (section 3.6). Under the v0.2 COSE envelope, `kid` identifies the signing key without establishing issuer authorization.
+1. A verifier MUST reject issuer authorization derived from an identifier the attested subject controls. When the authorization path resolves through `agent_id`, a DNS name under the subject's control, or any other identifier the subject can set, issuer and subject collapse into one role.
+
+This does not prohibit issuer and subject from being the same organization. It prohibits the authorization path from resolving through a subject-controlled identifier. The identity may be the same. The trust path may not.
+
+A resolved key that is not authorized for the declared issuer is an authorization failure. Authorization that cannot be determined is a distinct condition. Neither condition permits a `VALID` result. The verifier MUST distinguish an authorization failure from authorization that cannot be determined.
+
+The authorization path mechanism is deployment policy. This section requires the verifier to evaluate an authorization path independent of subject-controlled identifiers.
+
+#### 5.3.1 Runtime session binding for gateways
+
+A gateway that binds an Agent Manifest to a runtime session, such as cMCP, MUST use the manifest verification API rather than reconstructing a signing pre-image locally. In the Python SDK, the public entry point is `agent_manifest.verify_manifest(manifest, context, revocation_store)`; low-level signers and verifiers use `agent_manifest.signing_pre_image()`, which is the single source of truth for the RFC 8785 canonical byte sequence and the `hitl_record.approvals` normalization rule in section 3.6.
+
+For a runtime session binding, the verifier MUST check all of the following before treating the manifest identity as bound to the session:
+
+1. The manifest version is supported and the issuer signature verifies with a trusted issuer key.
+1. The current time is within the manifest validity window: `issued_at <= now < expires_at`.
+1. The authenticated workload subject for the current session equals the manifest `agent_id`. For SPIFFE deployments this is the leaf SVID subject. Development modes that derive the subject from configuration or from the manifest itself MUST surface that weaker subject source to relying parties.
+1. The runtime-loaded policy bundle hash equals `artifacts.policy_bundle.hash`.
+1. The runtime-loaded tool catalog hash equals `artifacts.tool_manifest.catalog_hash`.
+1. Any additional artifacts required by local policy, such as `artifacts.system_prompt.hash`, match the runtime values supplied in the `VerificationContext`.
+1. The manifest is not revoked.
+
+Because the entire `artifacts` object, `agent_id`, `issuer`, `issued_at`, `expires_at`, and `crypto_profile` fields are in the normative `signed_fields` set (section 3.6), these checks bind the session to the issuer-authenticated identity and artifact set.
+
+For the first cMCP integration profile, standard-profile Ed25519 manifests are sufficient. A gateway MAY support `ML-DSA-65` or `hybrid-Ed25519-ML-DSA-65` when the deployment requires the post-quantum profile, but it MUST reject any algorithm or `crypto_profile` it cannot verify; it MUST NOT silently downgrade to Ed25519-only verification for a post-quantum manifest.
+
+When `delegation_chain` is present, the session subject still binds to the current manifest's leaf `agent_id`. Each delegation hop is verified separately under section 3.4; the gateway MUST NOT require the session SVID to equal every principal in the chain.
+
+The `attestation` block is appended by the Confidential Runtime and is excluded from the issuer signature pre-image. A gateway MUST NOT use the attestation block as a substitute for the `agent_id` subject match above. If local policy requires hardware evidence, the gateway additionally sets `enforce_attestation=true` and validates the attestation block under section 3.3.
+
+### 5.4 Error Response Schema
+
+All non-2xx responses from the verification endpoint MUST use the following error response structure:
+
+```
+{
+  "error_code": "INVALID_REQUEST | MANIFEST_NOT_FOUND | ATTESTATION_UNAVAILABLE | RATE_LIMITED | INTERNAL_ERROR  -- REQUIRED",
+  "error_message": "<human-readable string>  -- REQUIRED",
+  "request_id": "<UUID v7>  -- REQUIRED",
+  "retry_after_seconds": "<positive integer | null>  -- REQUIRED for RATE_LIMITED, null otherwise"
+}
+```
+
+HTTP status code mapping:
+
+| `error_code`              | HTTP status |
+| ------------------------- | ----------- |
+| `INVALID_REQUEST`         | 400         |
+| `MANIFEST_NOT_FOUND`      | 404         |
+| `ATTESTATION_UNAVAILABLE` | 503         |
+| `RATE_LIMITED`            | 429         |
+| `INTERNAL_ERROR`          | 500         |
+
+### 5.5 Revocation Protocol
+
+The revocation protocol is defined in section 3.7. The verification service MUST implement the following endpoints:
+
+```
+POST /revoke
+Authorization: mTLS with SPIFFE SVID of authorized revoking party
+Content-Type: application/json
+Body: <revocation record per section 3.7>
+Returns: 201 Created with the published revocation record
+
+GET /revocation-status?manifest_id=<UUID v7>
+Returns: <revocation record> if revoked
+Returns: 404 if manifest_id is not found in the revocation log
+```
+
+Verifiers MUST check the revocation status endpoint before returning any `VALID` result. A 404 from the revocation status endpoint means the manifest has not been explicitly revoked (natural expiry is determined separately by comparing `expires_at` to the current time).
+
+## 6. Integration Architecture
+
+### 6.1 Integration with AGT
+
+The Agent Manifest is the attestation layer above AGT's policy enforcement layer. AGT evaluates policy decisions; the manifest proves those decisions were made under the approved policy, by the approved agent, using the approved tools. The integration points are:
+
+| AGT Component               | Agent Manifest Integration Point                                                                                                                                                   |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cedar policy engine         | `policy_bundle.hash` binds the policy bundle that AGT loads at startup. Policy bundle hash in the manifest MUST match `policy_bundle_hash` in the cMCP attestation report.         |
+| Tool-definition scanner     | `tool_manifest.catalog_hash` is the Merkle root over all per-tool (schema, description) leaf hashes that AGT's scanner approved. Any scanner-detected drift produces a mismatch.   |
+| Audit chain (Decision BOM)  | `decision_trace` binding points to AGT's hash-chained audit. The audit signing key is the same key that is TEE-sealed and whose root hash appears in `audit_chain_root`.           |
+| Agent identity (SPIFFE/DID) | `agent_id` in the manifest MUST match the SPIFFE SVID presented by the agent at every tool call. Identity continuity is the chain that links the manifest to the running agent.    |
+| Compliance export           | The verification result (section 5.2) is the AGT compliance export for external regulators - it replaces the current SOC 2 / NIST AI RMF export with a hardware-signed equivalent. |
+
+### 6.2 Integration with cMCP
+
+The Agent Manifest and cMCP are complementary primitives that operate at different layers of the same trust stack. cMCP attests the runtime enforcement layer; the Agent Manifest attests the complete agent identity surface. Their attestation fields overlap deliberately:
+
+| Field                  | cMCP Attestation                       | Agent Manifest                                 | Relationship                                              |
+| ---------------------- | -------------------------------------- | ---------------------------------------------- | --------------------------------------------------------- |
+| Policy bundle hash     | `policy_bundle_hash` in TEE report     | `policy_bundle.hash`                           | MUST be identical. Verifier cross-checks both.            |
+| Enforcement mode       | `enforcement_mode` in TEE report       | `policy_bundle.enforcement_mode`               | MUST match. Conflict = attestation failure.               |
+| Audit chain root       | `audit_chain_root` in TEE report       | Referenced by `decision_trace.audit_chain_uri` | Same audit chain; manifest provides the identity context. |
+| Container image digest | `container_image_digest` in TEE report | `supply_chain.container_image_digest`          | MUST be identical. Verifier cross-checks both.            |
+| Tool catalog hash      | Catalog hash in cMCP runtime           | `tool_manifest.catalog_hash` (Merkle root)     | cMCP enforces; manifest binds what was approved.          |
+
+#### 6.2.1 Enforcement Mode Vocabulary
+
+This subsection is informative. It carries no RFC 2119 keyword and adds no requirement beyond the enforcement mode row above. It records which name in each vocabulary denotes which state, so that "match" in that row has a single published reading rather than one supplied by each implementation.
+
+Three vocabularies name these states, and no two of them agree completely:
+
+| State                                    | Agent Manifest `policy_bundle.enforcement_mode` | cMCP runtime mode | TRACE claim `trace.policy.enforcement_mode` |
+| ---------------------------------------- | ----------------------------------------------- | ----------------- | ------------------------------------------- |
+| Decisions applied                        | `enforce`                                       | `enforcing`       | `enforce`                                   |
+| Decisions surfaced, call proceeds        | `advisory`                                      | `advisory`        | `advisory`                                  |
+| Decisions recorded, reporting suppressed | `audit-only`                                    | `silent`          | `silent`                                    |
+
+The manifest column is the value carried in the signed document and in the `enforcement_mode` field of the attestation report in section 3.3. The cMCP column is the runtime's own configured mode. The TRACE column is the value the runtime writes into a claim, constrained by the TRACE claim schema, which adopts the manifest's names for the first two states and the runtime's name for the third. What each runtime mode means is defined by cMCP, in TRACE section 4.3 and in the runtime's own enforcement mode type, and that definition governs the second and third columns.
+
+A verifier holding a cMCP attestation report or a TRACE claim translates into the manifest column before performing the comparison the row above calls for.
+
+The third row is a correspondence, not an equivalence, and the difference is deliberate rather than an oversight in either specification. cMCP's `silent` evaluates policy and records each decision while suppressing operational reporting to the caller. `audit-only` describes evaluating and recording without applying, and says nothing about whether the decision is reported. So a runtime in `silent` satisfies `audit-only`, while a runtime in `audit-only` is not necessarily in `silent`. The manifest is the coarser vocabulary here, and `audit-only` is the value a cMCP deployment in `silent` declares.
+
+Deliberately open. The manifest vocabulary is closed at these three values, so a runtime state finer than the manifest's has no value of its own to declare. Whether the manifest should grow such a value, and whether this correspondence should become normative with cMCP named as the sponsoring implementation, is unresolved.
+
+The reference SDK compares the manifest value against the runtime value as strings and performs no translation, so a caller populating `VerificationContext.enforcement_mode` supplies the value from the manifest column, not the name from either of the other two.
+
+### 6.3 Integration with MCP Protocol
+
+At the protocol level, Agent Manifest integration with MCP requires two additions to the standard MCP handshake:
+
+#### 6.3.1 Manifest Presentation at Connection
+
+When an agent's MCP client connects to an MCP server, the client SHOULD signal manifest support using two mechanisms:
+
+Current implementations (compatible with MCP 2025-11-25): Use the `_meta` field on the `initialize` request params with a namespaced key, and signal support via the `experimental` capability:
+
+```
+{
+  "method": "initialize",
+  "params": {
+    "clientInfo": {
+      "name": "<agent name>",
+      "version": "<agent version>"
+    },
+    "capabilities": {
+      "experimental": {
+        "co.opaque.agentManifest": { "version": "0.1" }
+      }
+    },
+    "_meta": {
+      "co.opaque.agentManifest": {
+        "id": "<UUID v7>",
+        "verificationEndpoint": "<HTTPS URI>"
+      }
+    }
+  }
+}
+```
+
+Future MCP versions: This specification will file an AAIF Spec Enhancement Proposal (SEP) to add `agentManifestId` and `agentManifestVerificationEndpoint` as optional fields on the MCP `Implementation` type. When that SEP is accepted, those fields MAY be placed directly on `clientInfo`. Until then, the `_meta` approach above is the conformant mechanism.
+
+An MCP server implementing the Agent Manifest extension SHOULD verify the manifest before servicing any tool calls. For cMCP Phase 2 servers running inside a TEE, this verification is performed inside the TEE and the result is included in the per-call evidence pack.
+
+#### 6.3.2 Manifest Binding in Tool Call Evidence
+
+Every tool call evidence record (TRACE envelope) produced by cMCP MUST include the agent's manifest ID and the verification result at the time of the call:
+
+```
+{
+  "trace_id": "<UUID v7>",
+  "agent_id": "<SPIFFE URI>",
+  "agent_manifest_id": "<UUID v7>",
+  "manifest_verification_result": "VALID | MISMATCH | EXPIRED | REVOKED | INCOMPLETE | ATTESTATION_UNAVAILABLE | INCOMPATIBLE_VERSION",
+  "tool_id": "<reverse-domain tool identifier>",
+  "policy_hash": "sha256:<64-hex-chars>",
+  "catalog_hash": "sha256:<64-hex-chars>",
+  "decision": "allow | deny | require-approval",
+  "decision_reason": "<Cedar policy fragment that made this decision>",
+  "payload_classification": "public | internal | confidential | restricted",
+  "egress_destination": "<FQDN | IP | none>",
+  "hitl_required": "<boolean>",
+  "hitl_approval_id": "<UUID v7> | null",
+  "timestamp": "<ISO 8601 UTC>",
+  "tee_measurement": "<platform-specific measurement>",
+  "signature": "<Ed25519 | ML-DSA-65 by TEE-sealed key>"
+}
+```
+
+Hash conflict resolution : If `policy_hash` in the TRACE envelope differs from `artifacts.policy_bundle.hash` in the agent manifest, the TRACE MUST set `manifest_verification_result: MISMATCH` for that call. The manifest is the authoritative source for approved artifact hashes; the TRACE reflects runtime measurements. A non-empty `mismatch_details` array in the verification result (section 5.2) MUST be generated for every such discrepancy. The `manifest_verification_result` field MUST use the same enum values as the `result` field in section 5.2 - no additional values. Any TRACE with `manifest_verification_result: MISMATCH` or `EXPIRED` MUST NOT be accepted as evidence of a valid tool call for regulatory reporting purposes.
+
+### 6.4 Crosswalk: OCSF Runtime Evidence
+
+> **Section 6.4.2 is normative. The rest of section 6.4 is informative.** The identity mapping carries conformance requirements for a producer that emits OCSF events for a manifest-governed session. The delegation crosswalk in 6.4.3 does not, and says why.
+
+A manifest attests an agent's identity surface at approval time. OCSF carries the runtime events that agent then produces. Nothing has connected the two: there is no defined join key between a manifest and the OCSF evidence emitted under it, so a consumer holding both cannot tell that they describe the same agent without an out-of-band convention.
+
+#### 6.4.1 Where `ai_agent` lives
+
+The `ai_agent` object is contributed by the **`ai_operation` profile**, not by a single event class. Any OCSF class that applies that profile can carry it, and `ai_agent.ai_model` carries model identity for agent-mediated operations. A crosswalk should therefore be written against the profile, because naming one class would bind this specification to a class assignment OCSF has not made.
+
+#### 6.4.2 Identity
+
+| OCSF (`ai_agent`) | OCSF's own definition                                                                                                                                                                                  | Intended manifest counterpart                                                                                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `uid`             | "The stable logical identifier for the agent... Persists across restarts and instances."                                                                                                               | `agent_id` (section 3.1), which is defined as the stable identity.                                                                                                                                      |
+| `instance_uid`    | "Identifier for a specific running instance or session of the agent, **distinct from the stable logical uid**. An instance is a single materialization of the agent: a conversation, session, or run." | `agent_instance_id` (section 3.1) when the manifest declares one. Otherwise the producer SHOULD use its own session identifier and MAY omit the field if none is available; it MUST NOT use `agent_id`. |
+| `version`         | "the agent's own code or configuration revision... distinct from the version of the model backing it"                                                                                                  | Not a join key. Static across a session.                                                                                                                                                                |
+| `charter`         | "A document that defines an AI agent's durable role, responsibilities, constraints, and operating boundaries."                                                                                         | Closest to the manifest itself, though the manifest is signed and scoped more narrowly. Not a join key.                                                                                                 |
+
+`session_uid` is **not** an attribute of `ai_agent`; where an event carries a session identifier it comes from elsewhere in the event, so it is not part of this crosswalk.
+
+A producer emitting an `ai_agent` object for a session governed by an Agent Manifest:
+
+1. MUST populate `ai_agent.uid` with the manifest `agent_id`.
+1. MUST populate `ai_agent.instance_uid` with the manifest `agent_instance_id` when the manifest declares one.
+1. MUST NOT populate `ai_agent.instance_uid` with `agent_id` when the manifest declares no `agent_instance_id`. It SHOULD populate that field with its own session-scoped identifier and MAY omit the field if no such identifier is available.
+1. MUST carry the `manifest_id` of the exact manifest in force, on any event class whose schema can express it, so the join is to a signed document rather than to a name.
+
+Rule 3 is the one that matters and the one an implementation is most likely to get wrong. Reusing `agent_id` as `instance_uid` makes the two OCSF fields equal on every event, which silently destroys the distinction between "every run of this agent" and "this run" for a consumer that has no way to tell the collapse happened. A producer SHOULD supply its own session identifier; if it cannot, omission preserves the distinction more safely than a stable value would.
+
+These rules bind the producer, not the manifest issuer: a manifest that declares no `agent_instance_id` is fully conformant, and rule 3 is how a producer stays conformant alongside it.
+
+#### 6.4.3 Delegation
+
+The `ai_operation` profile also carries a `delegation` object, and it is structurally the same idea as the delegation chain in section 3.4: `delegation.uid` identifies a durable authorization context, `parent_uid` references the delegation it was re-delegated from, and the result is "a directed acyclic graph (DAG) of re-delegations that supports lineage queries across the chain of authority."
+
+That is a closer correspondence than the identity fields, and it is the more useful one for an auditor, because it survives across events rather than describing one. It does not map cleanly today:
+
+- Section 3.4 identifies a hop by its `hop` index, `principal_id`, and `principal_manifest_id`. **There is no per-hop durable identifier** in the manifest chain, so nothing in a manifest can currently populate `delegation.uid` for a specific hop.
+- OCSF requires `delegation.uid` to be "generated by a trusted issuing authority... rather than self-asserted by the delegate". Section 3.4 hops are signed by the delegating principal, which is a different trust model: strong, but self-asserted by the delegator rather than issued by a broker.
+
+Closing that gap is a data-model change to section 3.4, not a crosswalk, and it is not proposed here.
+
+#### 6.4.4 How the `agent_id` question was settled
+
+The identity mapping was informative in the first revision of this section because `agent_id` was one field serving both of OCSF's roles, and a requirement binding it to `instance_uid` would have forced a stable identifier into the field OCSF defines as the non-stable one. Section 3.1 now settles it: `agent_id` is the stable identity, instance scope is declared in `agent_instance_id` rather than parsed out of a SPIFFE path, and a manifest that declares nothing governs every run.
+
+That is deliberately not the mapping proposed in issue #269, which asked that `instance_uid` equal `agent_id`. Taken at face value it would have made the two OCSF fields identical for every deployment that follows section 3.1's stated convention, which is the collapse rule 3 now forbids. What the proposal was right about is that a join key was missing and that `instance_uid` is the field it belongs in; splitting the declaration is how that key exists without overloading a field that already had a job.
+
+The remaining OCSF question is delegation (6.4.3), which needs a per-hop durable identifier in section 3.4 and a decision about issued rather than self-asserted authority. That is a data-model change, it is not settled here, and it stays informative until it is.
+
+Per section 3.1, the CoSAI WS4 working stream will assign the canonical `@context` URL for this specification, and an OCSF correlation mapping is the kind of thing that belongs in the same venue. Publishing the rules here rather than waiting is what gives that venue something specific to reject.
+
+### 6.5 Relationship to Agent Plugins
+
+> Sections 6.5.1 and 6.5.2 are informative boundary material. Section 6.5.3 defines the optional normative reference profile.
+
+[Agent Plugins 1.0.0](https://agent-plugins.org) is a packaging format for Agent Skills and MCP server configuration, maintained by a technical steering committee drawn from several client vendors. It is not a competitor to this specification and this specification is not a package format.
+
+The distinction in one sentence: **Agent Plugins describes what a client should install, and a manifest describes what actually ran.** Packaging is design time and portable across clients. A manifest is deployment time and bound to the environment that loaded it. A plugin bundle is therefore an input to a manifest rather than an alternative to one.
+
+#### 6.5.1 What Agent Plugins 1.0.0 leaves open
+
+The boundary is not an interpretation. It is stated in the format's own documents.
+
+`plugin.json` requires two fields, `$schema` and `name`. `version` is an unconstrained string. There is no integrity, signature or provenance field in the 1.0.0 schema.
+
+`FUTURE_CONSIDERATIONS.md` records, as non-normative future work rather than as conformance requirements:
+
+| Area                    | Status in 1.0.0, as stated by the format                                                                                                                                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Permission and approval | "v1.0.0 does not define a trust model, permission system, or sandboxing requirements for plugins."                                                                                                                                      |
+| Provenance verification | "v1.0.0 does not specify how clients or users can verify the origin or integrity of a plugin." Listed future work includes signature verification and attestation chains linking a published plugin to its source repository and build. |
+| Enterprise controls     | Allowlists by publisher or signature, organisation-scoped registries and compliance reporting are unspecified.                                                                                                                          |
+| Audit trail             | A lifecycle event schema covering actor, action and outcome is unspecified.                                                                                                                                                             |
+
+The specification text further states that distribution, installation, permissions and client-specific capabilities remain under each client's control.
+
+#### 6.5.2 Artifact overlap
+
+Of the ten artifacts in section 3, Agent Plugins carries two, and carries both as declarations rather than as resolutions.
+
+| Artifact                                                                                                                                        | Agent Plugins 1.0.0                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| System prompt                                                                                                                                   | Partly. `skills/*/SKILL.md` carries instruction material.                                                  |
+| Tool schemas                                                                                                                                    | Partly. `mcp.json` declares which servers to start. It does not enumerate the tools those servers exposed. |
+| Policy bundle, model identity, RAG corpus, memory state, decision trace, delegation chain, supply chain provenance, human-in-the-loop approvals | Not addressed.                                                                                             |
+
+The declared-versus-resolved distinction is the boundary in miniature. A bundle states an intended composition. A manifest attests the composition that was actually loaded, which is the only one an incident is ever about.
+
+#### 6.5.3 Optional Agent Manifest reference profile
+
+Agent Plugins 1.0.0 permits client-specific objects under reverse-domain keys in `extensions`. The optional Agent Manifest reference uses `com.agentrust-io.manifest`, derived from the controlled `agentrust-io.com` domain:
+
+```
+{
+  "extensions": {
+    "com.agentrust-io.manifest": {
+      "manifest_uri": "https://registry.example/manifests/demo.cose",
+      "manifest_digest": "sha256:<64 lowercase hex characters>"
+    }
+  }
+}
+```
+
+The namespace object MUST contain exactly `manifest_uri` and `manifest_digest`. `manifest_uri` MUST be an absolute HTTPS URI without embedded credentials or a fragment. `manifest_digest` MUST be the SHA-256 digest of the fetched manifest bytes, before any decoding. The plugin MUST NOT supply a trust key: verifiers obtain trusted keys through independent policy.
+
+The referenced signed manifest MUST carry `source_bundle.format: "agent-plugins-1.0.0"` and a matching `source_bundle.digest`. That digest is the section 3.2.5 Merkle construction over every regular bundle file, with paths bound as document identifiers, with one normalization: parse `plugin.json`, remove only `extensions.com.agentrust-io.manifest`, remove `extensions` if it is then empty, and encode the remaining object as RFC 8785 canonical JSON before making its leaf. This exclusion avoids a recursive digest while every other plugin field, extension namespace, and file remains covered.
+
+Absence of the namespace is `NOT_PRESENT`, not failure. A fetch failure is `UNRESOLVABLE`, not a claim that the plugin is invalid. Malformed reference data, a fetched-byte digest mismatch, an invalid manifest signature, or a mismatch between the local bundle and signed `source_bundle` MUST NOT verify. A verifier without the independently trusted key reports `UNVERIFIABLE`; it MUST NOT treat the key identifier inside a signature as a trust anchor.
+
+This is a namespaced compatibility profile, not a change to Agent Plugins itself. An upstream provenance field can supersede it later without changing the signed `source_bundle` semantics.
+
+## 7. Threat Model
+
+### 7.1 Threat Classes Addressed
+
+| Threat                       | Description                                                        | Without Agent Manifest                                       | With Agent Manifest                                                                                                 |
+| ---------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| T1 - Prompt Substitution     | System prompt replaced in memory between approval and runtime      | Undetectable. No binding exists.                             | `system_prompt.hash` mismatch immediately detectable at verification.                                               |
+| T2 - Policy Swap             | Cedar policy bundle replaced with permissive policy                | Detectable by AGT hash check (software). Bypassable by root. | `policy_bundle.hash` bound to TEE measurement. Hardware-impossible to swap silently.                                |
+| T3 - Tool Rug Pull           | MCP server mutates tool definition after approval                  | Detectable by AGT scanner (software). Re-hash bypassable.    | Per-tool leaf commits to both `schema_hash` and `description_hash`. Any mutation breaks `catalog_hash` Merkle root. |
+| T4 - Model Substitution      | Different model version runs than was approved                     | Undetectable. No standard binding.                           | `model_identity.version` bound. API models: version check at call time. Local models: binary hash.                  |
+| T5 - RAG Corpus Poisoning    | Malicious documents injected into knowledge base                   | Undetectable without corpus audit.                           | `rag_corpus.merkle_root` changes. Manifest invalidated. Verifier detects before agent runs.                         |
+| T6 - Scope Laundering        | Sub-agent claims broader permissions than delegating agent granted | Undetectable. No delegation chain standard.                  | `delegation_chain.scope_grant` is signed at each hop. Broader scope fails signature verification.                   |
+| T7 - Rogue Administrator     | Operator with root access rewrites audit logs or policy            | Bypassable. Software signing key is operator-held.           | `audit_key_sealed: true`. Key never leaves TEE. Log reconstruction hardware-impossible.                             |
+| T8 - HITL Forgery            | Human approval record fabricated without actual human review       | Undetectable without physical audit.                         | `approval_signature` produced by approver hardware key. Forgery requires key compromise.                            |
+| T9 - Supply Chain Compromise | Malicious dependency runs as approved binary                       | SLSA covers build-time. Runtime drift undetected.            | `container_image_digest` in TEE measurement. Modified binary produces measurement mismatch.                         |
+| T10 - Memory Drift           | Long-running agent accumulates unreviewed memory changes           | Undetectable. No memory baseline standard.                   | `memory_baseline.snapshot_hash` bound. `ttl_seconds` forces re-approval of memory state.                            |
+
+### 7.2 Out of Scope
+
+The following threats are explicitly out of scope for this specification:
+
+- Semantic prompt injection at the model layer - the manifest proves what prompt was approved; it cannot prevent a model from being misled by adversarial inputs within that prompt's scope.
+- Model weight poisoning - the `model_identity` binding attests which model is running; it does not attest the model's internal weights for locally-deployed models beyond the binary hash.
+- Side-channel attacks on the TEE - hardware vulnerabilities in AMD SEV-SNP, Intel TDX, or NVIDIA Blackwell that allow measurement extraction are out of scope. These are platform-level threats addressed by hardware vendors.
+- Denial of service against the verification endpoint - availability of the verification service is an operational concern, not a correctness concern.
+- Human approver compromise - if an authorized approver's hardware key is compromised, the HITL record is valid despite the fraudulent approval. Key management and approver identity assurance are out of scope.
+- Whether an approved configuration is a good one - every threat in 7.1 is a substitution, mutation, or forgery by an adversary. A system prompt authored in good faith, approved, signed, sealed and verified `VALID` may still specify behaviour the deploying organisation would reject if it were tested rather than read, with no adversary present and no digest changed. The manifest binds which configuration was approved. Section 3.2.1.1 defines where evidence about the approved configuration's behaviour is carried, and section 3.2.6.2 states the equivalent boundary for memory.
+- Per-call authorization - the manifest binds which tools were approved, not what a call through one of them may do. Argument-level policy, consequence bounds, and the read versus irreversible-write distinction inside a single tool belong to the policy layer that consumes a verification result. See section 5.3.2.
+
+## 8. Conformance Requirements
+
+### 8.1 Implementation Levels
+
+| Level   | Name          | Requirements                                                                                                                                                                                                                                                        | Use Case                                                                                                                            |
+| ------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Level 0 | Software-only | All artifact bindings. Standard crypto profile. Transparency log publication. No TEE requirement.                                                                                                                                                                   | Development, staging, non-regulated environments.                                                                                   |
+| Level 1 | TEE-attested  | Level 0 plus: TEE attestation block. `audit_key_sealed: true`. `container_image_digest` verified by hardware.                                                                                                                                                       | Enterprise production. Satisfies EU AI Act Art. 15 (cybersecurity), which applies from around December 2027 (section 9.1).          |
+| Level 2 | Full stack    | Level 1 plus: All 10 artifacts bound (per section 3.1 mapping table). HITL approvals present. Delegation chain for multi-agent. Phase 2 cMCP for all MCP servers. `log_retention.minimum_retention_days >= 180`. `drift_policy: deny-on-drift` or `alert-on-drift`. | Regulated industries. Satisfies DORA Art. 9, GDPR Art. 32 (when `data_scope` fields are populated for EU personal data processing). |
+| Level 3 | Post-quantum  | Level 2 plus: ML-DSA-65 signatures. ML-KEM-768 key exchange. SHAKE-256 hashing. Private Sigstore instance supporting ML-DSA-65.                                                                                                                                     | Sovereign deployments, classified, financial services with long-horizon sensitivity.                                                |
+
+Log retention requirement : Level 2 conformance requires a declared and enforced log retention configuration. The `log_retention` top-level manifest field MUST be present:
+
+```
+"log_retention": {
+  "minimum_retention_days": "<integer, REQUIRED, minimum 180 for EU AI Act compliance>",
+  "regulatory_retention_override": "<integer days, OPTIONAL, for sector-specific overrides (e.g. DORA: 1825 days / 5 years)>",
+  "retention_enforced_by": "<identifier of system responsible for enforcing retention policy, REQUIRED>"
+}
+```
+
+The EU AI Act (Art. 26 via Art. 12 and recital obligations) requires a minimum of 180 days (six months) log retention; that obligation applies from around December 2027 (section 9.1). Financial entities subject to DORA Art. 25(1) may require up to 1825 days (five years), and DORA is in force today. `minimum_retention_days` MUST be at least 180 for EU AI Act compliance and SHOULD be set from the strictest framework the deployment is actually subject to now.
+
+### 8.2 Conformance Test Suite
+
+A conformant Agent Manifest implementation MUST pass all tests in the reference test suite. The suite is organized into four modules:
+
+| Module    | Tests    | Coverage                                                                                                                                                    |
+| --------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AM-BIND   | 47 tests | Artifact binding correctness: hash computation, normalization, Merkle tree construction, schema validation.                                                 |
+| AM-CRYPTO | 38 tests | Signature generation and verification: Ed25519 (cofactorless), ML-DSA-65, hybrid, transparency log inclusion, RFC 8785 canonicalization.                    |
+| AM-ATTEST | 29 tests | TEE attestation binding: manifest hash in report, field cross-checks with cMCP, `audit_key_sealed` enforcement, per-platform measurement format validation. |
+| AM-VERIFY | 52 tests | Verification endpoint: result schema, mismatch detection, delegation chain validation, HITL verification, revocation status check, error response schemas.  |
+| AM-COMPAT | 31 tests | AGT integration, cMCP integration, MCP protocol extension, SLSA provenance binding.                                                                         |
+
+Total: 197 conformance tests. The test suite is published as an open-source repository under the agentrust-io organization and moves with the specification to its target standards body. Conformance claims MUST reference a specific test suite version and MUST include a passing test run against the reference implementation.
+
+## 9. Regulatory Mapping
+
+### 9.1 EU AI Act
+
+**When these obligations apply.** GPAI model-provider obligations (Arts. 51-53) have applied since 2 August 2025. Article 50 transparency duties have applied since 2 August 2026 (see section 9.1.2). The high-risk obligations mapped in the table below (Arts. 12-15, 26) are deferred under the current provisional legislative timeline (the Digital Omnibus amendments): Annex III systems from around 2 December 2027, and Annex I systems (AI embedded in regulated products) from around August 2028. These dates remain subject to the legislative process; implementers MUST verify against the [official implementation timeline](https://artificialintelligenceact.eu/implementation-timeline/) before asserting a compliance deadline. The mappings themselves are unaffected by the deferral. Obligations already in force under other frameworks - DORA for financial entities (section 9.2), HIPAA for US healthcare (section 9.3) - are unaffected.
+
+| Article                                    | Requirement                                                                                           | Agent Manifest Satisfaction                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Art. 13 - Transparency                     | High-risk AI systems must be transparent about their operation                                        | `agent_id`, `model_identity`, and `tool_manifest` provide the disclosure primitive. Note: when `model_attestation_type` is `provider-asserted`, the model identity binding is an operator assertion, not hardware-rooted attestation - this distinction is surfaced in verification results and may not satisfy the highest-risk tier transparency requirements for Art. 13. |
+| Art. 14 - Human Oversight (pre-deployment) | High-risk AI must allow humans to understand and intervene; oversight measures documented             | `hitl_record.approvals` satisfies Art. 14(4)(b)-(e) pre-deployment documentation obligations. `approval_signature` by hardware key satisfies non-repudiation for the approval event.                                                                                                                                                                                         |
+| Art. 14 - Human Oversight (operational)    | Art. 14(4)(a) requires the ability to stop or interrupt the system safely during operation            | `hitl_record.hitl_runtime.interrupt_endpoint` and `override_mechanism` satisfy the runtime stop/interrupt capability requirement. Both the pre-deployment approvals and the runtime oversight fields are required for full Art. 14 compliance.                                                                                                                               |
+| Art. 15 - Accuracy and Cybersecurity       | High-risk AI must be resilient to errors; cybersecurity measures documented                           | TEE attestation + `container_image_digest` satisfies the cybersecurity measure documentation requirement. Mismatch detection satisfies resilience.                                                                                                                                                                                                                           |
+| Art. 26 - Obligations for Deployers        | Deployers must monitor operation and report serious incidents; logging required                       | `decision_trace` + `audit_chain_root` provides the monitoring log. TEE-sealed signing key satisfies tamper-evidence requirement.                                                                                                                                                                                                                                             |
+| Art. 12 - Record-keeping (tamper-evidence) | High-risk AI must keep logs automatically; logs must be accurate                                      | `audit_key_sealed: true` satisfies the accuracy requirement - logs cannot be retroactively altered without detection.                                                                                                                                                                                                                                                        |
+| Art. 12 - Record-keeping (retention)       | Art. 26(6) requires minimum six-month log retention                                                   | Satisfied only when `log_retention.minimum_retention_days >= 180` is declared and enforced. Required for Level 2 conformance.                                                                                                                                                                                                                                                |
+| Art. 22 - Automated decision-making        | Where agents make automated decisions with significant effects on individuals, disclosure is required | When `data_scope.automated_decision_making` is `true`, Art. 22 disclosure obligations are triggered. The manifest's `data_scope` field (section 9.3) provides the machine-readable signal.                                                                                                                                                                                   |
+
+#### 9.1.1 EU AI Act Annex III Classification Guidance
+
+The obligations mapped in section 9.1 (Arts. 12-15, 26) apply only to high-risk AI systems under EU AI Act Annex III. Operators MUST determine whether their agent deployment qualifies before asserting compliance. The following Annex III categories are most likely to cover AI agent deployments:
+
+| Annex III Point | Category                                    | Example Agent Use Cases                                                                                       |
+| --------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Point 1         | Biometric identification and categorisation | Agents that identify or categorise individuals by biometric data                                              |
+| Point 2         | Critical infrastructure management          | Agents managing energy, water, transport, or financial infrastructure                                         |
+| Point 4         | Employment and worker management            | Agents performing recruitment screening, work allocation, or employee performance monitoring                  |
+| Point 5         | Access to essential private/public services | Agents performing creditworthiness assessment, risk scoring for insurance, benefits eligibility determination |
+| Point 6         | Law enforcement                             | Agents used in risk assessment, evidence analysis, or profiling in law enforcement contexts                   |
+
+Decision guidance: If the agent deployment falls within one of the above categories, Arts. 12-15 and 26 obligations apply and Level 2 conformance or above is recommended. If the deployment does not fall within Annex III, the manifest remains a useful provenance and governance primitive but the regulatory obligations in this section are not legally mandated.
+
+GPAI model providers (Anthropic, OpenAI, Google, etc.) are subject to separate obligations under Arts. 51-53 of the EU AI Act. These are distinct from the high-risk system obligations described here, which apply to operators deploying agents built on top of GPAI models.
+
+Operators in financial services should note that agents performing creditworthiness assessment or risk scoring for life and health insurance (Annex III Point 5(b)) are likely high-risk regardless of the underlying model provider.
+
+Article 50 is the exception to this subsection: its transparency duties attach to the interaction and the output, not to an Annex III classification, so they apply to agent deployments that are not high-risk. See section 9.1.2.
+
+#### 9.1.2 EU AI Act Article 50 - Transparency Obligations
+
+Article 50 applies from **2 August 2026**, subject to the Art. 111(4) transition for paragraph 2 described below. Other obligations already apply to agent deployments: Art. 4 on AI literacy and the original Art. 5 prohibitions have applied since 2 February 2025. Under Art. 113(a), as amended by [Regulation (EU) 2026/1744](https://eur-lex.europa.eu/legal-content/EN/ALL/?uri=CELEX:32026R1744), the newer Art. 5(1)(ba) and (bb), 5(1a), and 5(1b) apply from **2 December 2026**. Article 50's transparency duties depend on the interaction or output concerned and apply independently of Annex III high-risk classification; being outside Annex III does not itself exempt an operator.
+
+| Article 50 paragraph | Obligation                                                                                                                                    | Agent Manifest Satisfaction                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Art. 50(1)           | Natural persons must be informed they are interacting with an AI system, unless obvious                                                       | **Not satisfied.** The manifest has no field declaring the disclosure or binding it to the agent. Disclosure delivery is a runtime concern; AGT's `agent_os.transparency` interceptor enforces it at the tool-call boundary and is the current answer.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Art. 50(2)           | Providers of systems generating synthetic audio, image, video or text must mark outputs as artificially generated, in a machine-readable form | **Not satisfied.** No marking field exists. A marking that any party can strip does not survive the obligation's machine-readable requirement, which is why binding the mark to the attested agent that produced the output is the intended design rather than a metadata field. Tracked for a future revision. Note the timing: Art. 111(4), inserted by Regulation (EU) 2026/1744, requires providers of such systems placed on the market before 2 August 2026 to comply with Art. 50(2) by **2 December 2026**; systems placed on the market on or after 2 August 2026 are subject to it from that date. The gap recorded here is therefore against an obligation with a compliance date inside the current release cycle.                                                                                                                                                                                                                                                                                                                                                                         |
+| Art. 50(3)           | Deployers of emotion recognition or biometric categorisation systems must inform exposed persons                                              | **Not satisfied** in the manifest. Enforced at runtime by AGT's `agent_os.transparency` interceptor. Note that a manifest whose `hitl_record.approvals[].approved_scope` covers biometric tooling is evidence the deployment is in Art. 50(3) scope. Art. 5 is tested first. Art. 5(1)(f) prohibits the placing on the market, the putting into service for that purpose, or the **use** of AI systems to infer emotions of a natural person in the areas of workplace and education institutions, except for medical or safety reasons, and has applied since 2 February 2025 to deployers as well as providers. The same approved scope is therefore evidence of an Art. 50(3) disclosure duty in some settings and evidence of a prohibited deployment in others, and the manifest does not record which setting the deployment operates in. Where the deployment is prohibited, Art. 50(3) compliance does not cure it. Both provisions turn on the Art. 3(39) definition, which requires inference from biometric data, so a system inferring emotional state from text alone falls outside both. |
+| Art. 50(4)           | Deepfake and public-interest text disclosure                                                                                                  | **Not satisfied.** Same gap as Art. 50(2).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+
+The runtime enforcement named for Art. 50(1) and 50(3) produces no attestable artifact. AGT's `agent_os.transparency` interceptor blocks tool execution until `confirm_disclosure` or `acknowledge_emotion_recognition` is called for a session, but that enforcement leaves no hash, no signature, and no record outside the running process. A party who cannot inspect that process has source code to trust and nothing to verify, so the section's warning above holds in both directions: the manifest is not evidence of Article 50 compliance, and the runtime control it defers to produces none either. This is a known coverage gap rather than a scoping decision.
+
+Implementers MUST NOT read the manifest as evidence of Article 50 compliance. Where the deployment is in Article 50 scope, the disclosure and marking controls are separate and must be documented separately.
+
+### 9.2 DORA (EU) and Financial Sector Guidance
+
+| Framework                            | Requirement                                                                                   | Agent Manifest Satisfaction                                                                                                                                                                                                                                                                   |
+| ------------------------------------ | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| DORA Art. 9                          | ICT systems must be resilient; evidence of what ran and when                                  | Verification result + `evidence_pack` provides per-invocation evidence of what agent ran, under what policy, at what time. Hardware-signed.                                                                                                                                                   |
+| DORA Art. 28 (third-party oversight) | Third-party ICT risk management; independent oversight                                        | an independent attestation authority. Verification endpoint reachable by regulator without operator involvement.                                                                                                                                                                              |
+| DORA Art. 28(3) (ICT registry)       | Financial entities must maintain a registry of all ICT third-party service arrangements       | Agent Manifest records, when aggregated, constitute the primary data source for the Art. 28(3) ICT third-party registry. Manifests SHOULD be exported to the financial entity's registry system. The `attestation_service` field enables documentation of the attestation service dependency. |
+| DORA Art. 28(4) (concentration risk) | Financial entities must assess concentration risk for critical ICT dependencies               | The attestation service is a critical ICT dependency for Level 2+ deployments and MUST be documented in the Art. 28(4) concentration risk assessment. Financial entities MUST define an exit strategy per Art. 28(8) covering the scenario where the attestation service is unavailable.      |
+| NIST AI RMF - GOVERN 1.2             | Organizational teams are committed to transparent and accountable AI risk management policies | `policy_bundle.hash` bound to hardware attestation proves policy implementation, not just documentation.                                                                                                                                                                                      |
+| NIST AI RMF - GOVERN 1.7             | Processes and procedures for decommissioning and phasing out AI systems safely                | Revocation records (section 3.7) published to the transparency log serve as the decommissioning artifact. The `decision_trace` records for decommissioned agents are retained per `log_retention` policy. `agent_id` continuity in the rotation chain enables post-decommission audit.        |
+
+OCC AI guidance note : OCC/FDIC/Fed Bulletin 2026-13 (issued 17 April 2026) explicitly excludes generative AI and agentic AI from scope. Financial entities deploying agents MUST apply existing enterprise risk management frameworks (SR 11-7 successor guidance, FDIC FIL-22-2023 model risk principles) until dedicated agentic AI guidance is issued. The Agent Manifest supports general model governance obligations - version tracking, capability declarations, audit trails - that financial entities should document under their existing frameworks pending OCC rulemaking. Section 10.2 (v0.2 roadmap) includes tracking the OCC RFI process.
+
+### 9.3 GDPR, HIPAA, and Additional Regulatory Frameworks
+
+#### GDPR Art. 32 and Art. 35
+
+GDPR Art. 32 compliance for AI agents requires: attribute-based access control documented at the agent level, tamper-evident audit records for every AI agent interaction with personal data, and prompt injection defenses as Art. 32 security controls. The manifest's artifact hashing, TEE-sealed audit keys, and tool manifest scoping support Art. 32's technical measures requirement.
+
+The following `data_scope` field MUST be populated when the agent processes EU personal data (required for Level 2 conformance when processing EU personal data):
+
+```
+"data_scope": {
+  "personal_data_categories": ["<GDPR Art. 30 processing categories>  -- REQUIRED when processing personal data"],
+  "legal_basis": ["<GDPR Art. 6 legal basis identifiers>  -- REQUIRED when processing personal data"],
+  "automated_decision_making": "<boolean>  -- REQUIRED, triggers Art. 22 disclosure when true",
+  "dpia_reference": "<URI to Art. 35 DPIA document>  -- CONDITIONALLY REQUIRED for high-risk processing"
+}
+```
+
+When `automated_decision_making` is `true`, Art. 22 disclosure obligations are triggered and the deployer MUST provide information to affected individuals about the automated decision-making mechanism.
+
+For Art. 35 DPIA support, the `dpia_reference` URI points to the DPIA document covering this agent deployment. The manifest's `data_scope.personal_data_categories` and `tool_manifest` fields provide the information inventory that feeds the DPIA.
+
+#### HIPAA Security Rule
+
+Healthcare AI agents processing protected health information (PHI) are subject to the HIPAA Security Rule (45 CFR 164.312). The following manifest fields directly address HIPAA technical safeguard requirements:
+
+| HIPAA Requirement     | CFR Reference        | Agent Manifest Satisfaction                                                                                             |
+| --------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Audit controls        | 45 CFR 164.312(b)    | `decision_trace.audit_chain_root` + `audit_key_sealed: true` provides hardware-anchored, tamper-evident audit controls. |
+| Integrity controls    | 45 CFR 164.312(c)(1) | Artifact hash bindings ensure PHI-processing configurations are not altered without detection.                          |
+| Transmission security | 45 CFR 164.312(e)(1) | TLS 1.3 transport with attestation extensions (section 4.1) satisfies the transmission security standard.               |
+
+#### PCI-DSS v4.0
+
+Financial agents processing cardholder data are subject to PCI-DSS v4.0. Relevant requirements:
+
+| PCI-DSS Requirement                         | Coverage                                                                                                                                                         |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Requirement 10.3 (audit log protection)     | `audit_key_sealed: true` provides hardware-rooted protection against audit log destruction and unauthorized modification, directly addressing PCI-DSS Req. 10.3. |
+| Requirement 12.3.2 (targeted risk analysis) | The manifest's artifact binding and verification protocol provides the evidence base for targeted risk analysis of AI-driven controls.                           |
+
+#### FedRAMP High
+
+Federal agencies evaluating the Agent Manifest for use in FedRAMP High environments should note the following control family alignments:
+
+| FedRAMP Control                           | Coverage                                                                                                  |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| AC-2 (Account Management)                 | `agent_id` SPIFFE SVID provides machine identity; `delegation_chain` provides access authorization chain. |
+| AU-2, AU-9 (Audit and Accountability)     | `decision_trace` + `audit_key_sealed` satisfies audit generation (AU-2) and audit protection (AU-9).      |
+| SA-12 (Supply Chain Risk Management)      | `supply_chain` block with SLSA provenance and SBOM binding directly addresses SA-12.                      |
+| SC-28 (Protection of Information at Rest) | TEE-sealed audit key ensures audit records at rest are protected from operator-level access.              |
+
+### 9.4 Operational Lifecycle Disclosures
+
+EU AI Act Art. 13(3)(c) and (e) require that instructions for use include information about predetermined changes to the system and its performance, and the expected operational lifetime and maintenance measures. The following `operational_lifecycle` field satisfies these requirements:
+
+```
+"operational_lifecycle": {
+  "expected_lifetime_days": "<integer>  -- REQUIRED for Art. 13 compliance",
+  "planned_maintenance_schedule": "<cron expression or human-readable description>  -- OPTIONAL",
+  "update_policy": "<URI to provider's software update policy>  -- OPTIONAL",
+  "reissuance_triggers": ["model_version_change | policy_major_version | tool_schema_change | <other>"]
+}
+```
+
+The Art. 13 row in section 9.1 cross-references `operational_lifecycle.expected_lifetime_days` for Art. 13(3)(e) and `operational_lifecycle.reissuance_triggers` for Art. 13(3)(c).
+
+## 10. Roadmap and Standards Path
+
+### 10.1 Version 0.1 - This Specification
+
+- Complete data model for all 10 artifacts
+- Cryptographic protocol definitions for standard and post-quantum profiles
+- Verification API specification with error schemas and revocation protocol
+- TEE attestation binding protocol with per-platform profiles
+- Conformance test suite (197 tests)
+- Reference implementation targeting CoSAI WS4 + cMCP
+
+### 10.2 Version 0.2
+
+Targets: Q3 2026. Driven by community and early adopter feedback collected during the CC Summit period (June to September 2026).
+
+- COSE_Sign1 signature envelope, replacing the v0.1 canonical-JSON detached signature and aligning with RFC 9943 (SCITT). Gated on the `version` field: v0.1 manifests continue to verify unchanged. Specified in [agent-manifest-cose-envelope-v0.2.md](https://manifest.agentrust-io.com/spec/agent-manifest-cose-envelope-v0.2/index.md); see ADR-0011 for the decision
+- `model_identity` reference to an OpenSSF Model Signing (OMS) signature bundle, so a verifier can follow the chain from the agent to the model publisher's signature instead of trusting an operator-asserted hash. See section 10.5
+- Memory baseline protocol for stateful agents (v0.1 defines the binding; v0.2 defines the checkpoint protocol)
+- RAG corpus incremental update protocol - how to bind a delta without re-hashing the full corpus
+- Multi-model manifest - binding for agents that use different models for different subtasks
+- Federated verification - cross-organizational manifest verification without shared infrastructure
+- A2A delegation chain revocation - how to invalidate a mid-chain delegation without revoking the full manifest
+- OCC RFI tracking - align to any agentic AI governance guidance issued by OCC, FDIC, or the Federal Reserve following the 2026 RFI process
+- CoSAI WS4 scanner registry - define a registered scanner identifier format for `poisoning_scan.scanner_version`
+
+### 10.3 Version 1.0 - Proposed CoSAI Standard
+
+Target: Q1 2027. Contribution to CoSAI Working Stream 4 (Secure Design Patterns for Agentic Systems) as an OASIS Open Project deliverable. Sequencing is set by WS4: the Phase 1 review opened in [WS4 issue #149](https://github.com/cosai-oasis/ws4-secure-design-agentic-systems/issues/149) and no contribution is proposed until that review closes and WS4 decides.
+
+- Finalized data model with no breaking changes from v0.2
+- Interoperability validated with at least three independent implementations
+- CoSAI WS4 review and endorsement
+- Reference implementation contributed as a CoSAI Open Project deliverable
+- Conformance certification program defined
+- Transfer of `manifest.agentrust-io.com` (or successor provisional domain) to CoSAI/OASIS-controlled infrastructure as a condition of v1.0 acceptance. The canonical `@context` URL will be updated to a CoSAI-controlled namespace at this point.
+- Opaque's participation terms under the OASIS Open Projects IPR Policy, including the CLA and the patent non-assert covering non-trivial contributions, reviewed and signed off by counsel before any contribution is filed. See [CHARTER.md](https://github.com/agentrust-io/agent-manifest/blob/main/CHARTER.md) section 4.
+
+### 10.4 Relationship to Existing Standards
+
+| Standard                               | Relationship                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| SPIFFE/SPIRE                           | Agent Manifest uses SPIFFE SVIDs for `agent_id` and `principal_id`. Agent Manifest extends, not replaces, SPIFFE.                                                                                                                                                                                                                                                                                            |
+| SLSA                                   | `supply_chain.slsa_provenance` references SLSA attestations. Agent Manifest adds runtime measurement on top of SLSA build-time provenance.                                                                                                                                                                                                                                                                   |
+| CycloneDX / SPDX (SBOM)                | `supply_chain.sbom` references a CycloneDX or SPDX SBOM. Agent Manifest binds the SBOM hash; it does not replace SBOM tooling.                                                                                                                                                                                                                                                                               |
+| MCP (Anthropic / AAIF)                 | Agent Manifest extends MCP's `initialize` handshake and tool call protocol. It is protocol-agnostic but MCP is the reference implementation.                                                                                                                                                                                                                                                                 |
+| A2A (Google / Linux Foundation)        | No current A2A standard defines a delegation chain. The Agent Manifest delegation chain is a proposed primitive designed for protocol agnosticism, intended to align with A2A specifications as they mature.                                                                                                                                                                                                 |
+| Sigstore / Rekor                       | `transparency_log_entry` uses Rekor or a compatible CT log. Sigstore tooling (cosign) can sign manifests in the standard profile. Level 3 deployments require a private Sigstore instance with ML-DSA-65 support (see section 4.2).                                                                                                                                                                          |
+| OpenTelemetry                          | `decision_trace` integrates with OTel spans. Each manifest-bound tool call produces an OTel span with the manifest ID as a baggage item.                                                                                                                                                                                                                                                                     |
+| CoSAI WS1                              | `supply_chain` provenance aligns with CoSAI Working Stream 1 (AI supply chain security). Agent Manifest is a candidate for CoSAI WS1 recommendation.                                                                                                                                                                                                                                                         |
+| RFC 8785 (JCS)                         | All canonical JSON serialization uses RFC 8785. This is a normative dependency.                                                                                                                                                                                                                                                                                                                              |
+| RFC 9162 (Certificate Transparency v2) | Merkle tree construction and transparency log structures follow RFC 9162.                                                                                                                                                                                                                                                                                                                                    |
+| RFC 9334 (RATS Architecture)           | The attestation service plays the RATS Verifier role. Platform-native attestation reports are normalized to EAT (RFC 9711) for third-party verification.                                                                                                                                                                                                                                                     |
+| RFC 9711 (EAT)                         | EAT is the attestation-token format for evidence about a running environment. Agent Manifest consumes an EAT as an input to the `attestation` block; it does not compete with it. The manifest itself is a signed document, not a token. See ADR-0011.                                                                                                                                                       |
+| RFC 9943 (SCITT)                       | The closest analog to Agent Manifest: signed statements plus a transparency log with receipts. Agent Manifest is the agent-layer profile of this model; see section 10.5 for the term-by-term mapping. The envelope moves to COSE_Sign1 in v0.2 per ADR-0011.                                                                                                                                                |
+| OpenSSF Model Signing (OMS)            | OMS signs the model as an artifact: a detached signature bundle in Sigstore Bundle Format listing every model file by digest. Agent Manifest binds `model_identity` to the deployed model and does not re-specify model signing. Where a model ships with an OMS bundle, `model_hash` should be the digest that bundle binds, so the two agree by construction rather than by coincidence. See section 10.5. |
+| RFC 9562 (UUID v7)                     | All UUID fields in the manifest use UUID v7 per RFC 9562.                                                                                                                                                                                                                                                                                                                                                    |
+
+### 10.5 SCITT Profile Mapping
+
+Agent Manifest is not a new transparency architecture. It is the agent-layer profile of the one the IETF standardized in RFC 9943 (SCITT), and every structural piece of this specification already has a SCITT name. Stating the correspondence explicitly is what makes "profile of SCITT" a claim rather than a slogan, and it tells an implementer which parts of this document are agent-specific and which are inherited.
+
+| SCITT term (RFC 9943) | Agent Manifest equivalent                                                                                                                                                                                                                  |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Artifact              | The deployed agent, as configured at a point in time                                                                                                                                                                                       |
+| Subject               | `agent_id`, a SPIFFE URI (section 3.1)                                                                                                                                                                                                     |
+| Statement             | The manifest document: the ten artifact bindings plus identity, lifetime, and issuer metadata                                                                                                                                              |
+| Issuer                | `issuer`, the SPIFFE URI of the signing authority (section 3.1)                                                                                                                                                                            |
+| Signed Statement      | The signed manifest (section 3.6). COSE_Sign1 from v0.2 per ADR-0011, which is what RFC 9943 requires of a Signed Statement                                                                                                                |
+| Transparency Service  | The Rekor or consortium log the manifest is submitted to (section 3.6)                                                                                                                                                                     |
+| Receipt               | The inclusion proof carried in `transparency_log_entry`                                                                                                                                                                                    |
+| Transparent Statement | A signed manifest whose `transparency_log_entry` is populated. This specification already requires production deployments to reach this state: a signature alone is explicitly declared insufficient for regulatory purposes (section 3.6) |
+| Registration Policy   | What a Transparency Service checks before registering a manifest, for example the declared conformance level (section 8.1) and whether the signing key is authorized for the claimed issuer (section 5.3)                                  |
+| Auditor               | Any third party reconstructing an agent's history from the log without trusting the operator, which is the premise of section 1.1 and the threat model of section 7                                                                        |
+
+The agent-specific contribution is the Statement payload: what it means to describe an *agent* completely enough that a third party can tell whether the one running is the one approved. That is sections 3.2 through 3.5. Everything around it (signing, registration, receipts, auditing) is SCITT, and should be read as such rather than as a parallel invention.
+
+#### What this specification deliberately does not restate
+
+Composition is the point. Three adjacent efforts already solve problems that Agent Manifest binds rather than re-solves:
+
+- **The model artifact: OpenSSF Model Signing (OMS).** OMS produces a detached signature bundle, in Sigstore Bundle Format, listing every file of a model by digest, covering weights, configuration, and tokenizer as one unit. Agent Manifest does not define a competing model-signing scheme. `model_identity.model_hash` (section 3.2.4) binds the model a specific agent is approved to run; where the model publisher ships an OMS bundle, that hash should be the digest OMS binds, and a future revision will add an explicit field for the bundle reference so a verifier can follow the chain from agent to model publisher without an out-of-band lookup.
+- **Build provenance: SLSA and in-toto.** `supply_chain` references SLSA attestations (section 3.2.8) rather than re-encoding build steps.
+- **Transparency: SCITT and Sigstore.** The log, its receipts, and the auditing model are SCITT's, as mapped above.
+
+The consequence for implementers is that an Agent Manifest deployment inherits the tooling and the review history of these efforts, and the gap Agent Manifest fills is the one none of them addresses: no existing standard binds a system prompt, a policy bundle, a tool catalog, a memory baseline, a delegation chain, and a human approval into a single artifact that hardware can attest to.
+
+## 11. Appendix
+
+### A. Glossary
+
+| Term              | Definition                                                                                                                                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Agent Manifest    | The cryptographically signed, hardware-attestable document defined by this specification.                                                                                                                                            |
+| Attestation       | A hardware-produced measurement that proves what code is running inside a TEE without trusting the operator.                                                                                                                         |
+| A2A               | Agent-to-Agent protocol. A wire protocol for inter-agent communication, currently governed by the Linux Foundation. As of the date of this specification, no A2A standard defines a delegation chain or inter-agent trust primitive. |
+| AGT               | Agent Governance Toolkit. The open-source agent governance framework created by Imran Siddique; reference implementation of this specification's software layer.                                                                     |
+| Catalog Hash      | Merkle root over per-tool leaf hashes, where each leaf commits to both the tool's schema hash and description hash.                                                                                                                  |
+| cMCP              | Confidential MCP. A hardware-attested MCP runtime; the reference implementation of this specification's attestation layer.                                                                                                           |
+| Decision BOM      | Decision Bill of Materials. AGT's per-audit-record structure capturing the inputs, policy decision, and outcome for each governance decision.                                                                                        |
+| Delegation Chain  | The ordered sequence of principals and scope grants from root human principal to the current agent. An original design of this specification; no published A2A standard defines an equivalent primitive.                             |
+| HITL              | Human-in-the-Loop. A human oversight event that is recorded and bound in the manifest.                                                                                                                                               |
+| JCS               | JSON Canonicalization Scheme. RFC 8785. The canonical JSON serialization algorithm used throughout this specification.                                                                                                               |
+| Manifest ID       | A UUID v7 (time-ordered, per RFC 9562) that uniquely identifies a specific version of an Agent Manifest. Immutable per issuance.                                                                                                     |
+| Merkle Root       | The root hash of a Merkle tree over a set of artifact hashes using RFC 9162 domain-separated construction. Changing any artifact changes the root.                                                                                   |
+| ML-DSA-65         | Module Lattice-based Digital Signature Algorithm, parameter set 65. NIST FIPS 204. Post-quantum signature scheme.                                                                                                                    |
+| PROVIDER_ASSERTED | A verification result status for `model_identity` indicating the model binding is an operator assertion rather than a hardware-rooted hash binding. Returned when `model_attestation_type` is `provider-asserted`.                   |
+| RATS              | Remote ATtestation procedureS. IETF architecture (RFC 9334) for remote attestation. The attestation service acts as a RATS Verifier.                                                                                                 |
+| Rug Pull          | An attack where a previously-approved tool endpoint silently mutates its capability definitions after the security review concluded.                                                                                                 |
+| Scope Laundering  | An attack where a sub-agent claims broader permissions than its delegating principal granted.                                                                                                                                        |
+| TEE               | Trusted Execution Environment. Hardware-isolated memory region (AMD SEV-SNP, Intel TDX, NVIDIA Blackwell, ARM CCA) where code runs protected from the host OS and operator.                                                          |
+| TRACE Envelope    | The portable, hardware-signed evidence artifact produced by cMCP for every tool call. Contains the verification result plus per-call decision evidence.                                                                              |
+
+### B. Change Log
+
+| Version | Date      | Author         | Changes                                                                                                                                    |
+| ------- | --------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0.1     | June 2026 | Imran Siddique | Initial draft. Complete data model, 10 artifacts, cryptographic protocols, verification API, conformance requirements, regulatory mapping. |
+
+### C. Acknowledgments
+
+This specification builds on architectural work developed across the Agent Governance Toolkit (AGT), the Confidential MCP (cMCP) specification, the OPAQUE Systems Agent Trust Platform design, and prior research into Cryptographic Agent Provenance and Verifiable Agent Delegation. The delegation chain design is informed by the IATP (Inter-Agent Trust Protocol) architecture developed in the context of the Agent Internet proposal. The post-quantum profile extends AGT's existing ML-DSA-65 implementation. The HITL record design is informed by the EU AI Act Art. 14 implementation guidance from the European AI Office.
+
+______________________________________________________________________
+
+*Agent Manifest Specification v0.1 - AgentTrust - June 2026*
+
+### D. RFC 8785 Canonical JSON Test Vector
+
+Input:
+
+```
+{"version":"0.1","issued_at":"2026-06-23T09:00:00Z","agent_id":"spiffe://trust.example/agent/kyc/prod-001"}
+```
+
+RFC 8785 canonical form (UTF-8, no trailing newline):
+
+```
+{"agent_id":"spiffe://trust.example/agent/kyc/prod-001","issued_at":"2026-06-23T09:00:00Z","version":"0.1"}
+```
+
+Keys sorted lexicographically. No whitespace.
+
+SHA-256 of canonical form:
+
+```
+b83293348255f4427dc030478f354b83f4f82662223be0926ad9f2db946b5319
+```
+
+Verification:
+
+```
+from jcs import canonicalize  # pip install jcs
+import hashlib
+obj = {"version":"0.1","issued_at":"2026-06-23T09:00:00Z",
+       "agent_id":"spiffe://trust.example/agent/kyc/prod-001"}
+canonical = canonicalize(obj)
+assert hashlib.sha256(canonical).hexdigest() == "b83293348255f4427dc030478f354b83f4f82662223be0926ad9f2db946b5319"
+```
