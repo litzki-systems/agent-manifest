@@ -17,6 +17,22 @@
 
 ### Fixed
 
+- **[SPEC]** Two places describing v0.2 manifest semantics still assumed the
+  removed v0.1 `signature`/`transparency_log_entry` model, left over from the
+  spec's v0.1/v0.2 split (section 3.6) not reaching every mention outside
+  that section. Section 3.7's revocation record schema listed
+  `transparency_log_entry` as unconditionally `REQUIRED`; it's now qualified
+  as v0.1-only, with the v0.2 case pointing to the COSE `receipts` header per
+  `agent-manifest-cose-envelope-v0.2.md`, matching the split already applied
+  to the manifest's own transparency proof in section 2.2. The Verification
+  API reference described `signing_pre_image()` — the v0.1 field-allowlist
+  pre-image with `hitl_record.approvals` normalization — as shared by all
+  signers and verifiers; it's now marked v0.1-only, with v0.2 verification
+  pointed to `verify_cose_manifest()` / `cose_payload()`, which sign the
+  payload as received with no allowlist and no approvals normalization
+  (`_cose.py` already documented this distinction; the docs page didn't).
+  Documentation only, no implementation change.
+
 - **[SDK]** `verify_manifest()` now recomputes a tool catalog's Merkle root
   from its supplied `tools` before accepting the declared `catalog_hash`.
   A valid signature and a matching runtime hash no longer hide inconsistent
